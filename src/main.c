@@ -8,6 +8,10 @@
 
 #include "stb_image_write.h"
 
+#define FETCH_ADD(ptr, val) __atomic_fetch_add(ptr, val, __ATOMIC_RELAXED)
+
+#if 1
+
 #define ASSERT(expr)                                                                                                   \
     do {                                                                                                               \
         if (!(expr)) {                                                                                                 \
@@ -15,6 +19,12 @@
             raise(SIGTRAP);                                                                                            \
         }                                                                                                              \
     } while (0)
+
+#else
+
+#define ASSERT(expr)
+
+#endif
 
 #define ASSERT_ZERO(a, tol) ASSERT(fabs(a) < tol)
 
@@ -61,7 +71,7 @@ typedef struct {
     Sphere spheres[1024];
     Material materials[64];
 
-    _Atomic u64 traced_ray_count;
+    u64 traced_ray_count;
 } World;
 
 typedef struct {
@@ -87,7 +97,7 @@ typedef struct {
 typedef struct {
     WorkItem* items;
     u32 item_count;
-    _Atomic u32 next_work_item;
+    u32 next_work_item;
 } WorkQueue;
 
 v3 v3_sub(v3 u, v3 v)
@@ -168,25 +178,21 @@ v3 v3_hadamard(v3 u, v3 v)
     return (v3){u.x * v.x, u.y * v.y, u.z * v.z};
 }
 
-b32 find_intersect(World* world, v3 orig, v3 dir, Intersect* intersect)
+b32 find_intersect(const World* world, v3 orig, v3 dir, Intersect* intersect)
 {
     b32 res = 0;
     for (u32 i = 0; i < world->sphere_count; i++) {
-        Sphere* sphere = &world->spheres[i];
+        const Sphere* sphere = &world->spheres[i];
 
         // normSq(o + t * d - c)  = r^2
         // normSq(o - c) + t^2 * normSq(d) + 2.0f * (o - c) . d * t - r^2 = 0
 
         v3 co = v3_sub(orig, sphere->center);
-        // printf("co = %f %f %f\n", co.co[0], co.co[1], co.co[2]);
-        // printf("dir = %f %f %f\n", dir.co[0], dir.co[1], dir.co[2]);
 
         float b = 2.0f * v3_dot(co, dir);
         float c = v3_dot(co, co) - sphere->radius * sphere->radius;
 
-        // printf("b = %f, c = %f\n", b, c);
         float disc = b * b - 4 * c;
-        // printf("disc = %f\n", disc);
         if (disc < .0f) {
             continue;
         }
@@ -199,7 +205,6 @@ b32 find_intersect(World* world, v3 orig, v3 dir, Intersect* intersect)
 
             intersect->t = t;
             intersect->object_index = i;
-            /* intersect->normal = v3_div(cp, sphere->radius); */
             intersect->normal = v3_normalized(cp);
 
             res = 1;
@@ -223,15 +228,22 @@ b32 find_intersect(World* world, v3 orig, v3 dir, Intersect* intersect)
     return res;
 }
 
-float rand_float()
+u32 random_u32(u32* state)
 {
-    return (float)rand() / RAND_MAX;
+    *state = 1103515245 * (*state) + 12345;
+
+    return *state;
 }
 
-v3 random_cosine_weighted()
+float random_float(u32* state)
 {
-    float theta = rand_float() * M_PI * 2.0f;
-    float u = rand_float();
+    return (float)random_u32(state) / UINT32_MAX;
+}
+
+v3 random_cosine_weighted(u32* rng)
+{
+    float theta = random_float(rng) * M_PI * 2.0f;
+    float u = random_float(rng);
     float r = sqrtf(u); // homogeneize
 
     v3 res;
@@ -242,32 +254,36 @@ v3 random_cosine_weighted()
     return res;
 }
 
-v3 trace_ray(World* world, v3 orig, v3 dir, u32 max_depth);
-
-v3 shade(World* world, Intersect* itx, u32 max_depth)
+v3 trace_ray(const World* world, u32* rng, v3 orig, v3 dir, u32 max_depth, u32* bounces)
 {
-    Material* mat = world->spheres[itx->object_index].material;
-    v3 result = mat->emission;
-    v3 bounce_dir = v3_in_basis(random_cosine_weighted(), itx->tangent1, itx->tangent2, itx->normal);
+    v3 result = {};
+    v3 transmitted = (v3){1.0f, 1.0f, 1.0f};
+    *bounces = 0;
 
-    v3 bounce_radiance = trace_ray(world, itx->point, bounce_dir, max_depth); // no need for cosine term
+    for (u32 depth = 0; depth < max_depth; depth++) {
+        Intersect itx = {};
+        itx.t = INFINITY;
 
-    result = v3_add(result, v3_hadamard(mat->diffuse, bounce_radiance));
+        if (find_intersect(world, orig, dir, &itx)) {
+            (*bounces)++;
 
-    return result;
-}
+            Material* mat = world->spheres[itx.object_index].material;
 
-v3 trace_ray(World* world, v3 orig, v3 dir, u32 max_depth)
-{
-    world->traced_ray_count++;
+            result = v3_add(result, v3_hadamard(transmitted, mat->emission));
 
-    Intersect itx = {};
-    itx.t = INFINITY;
-    if (max_depth > 0 && find_intersect(world, orig, dir, &itx)) {
-        return shade(world, &itx, max_depth - 1);
-    } else {
-        return (v3){0.05f, 0.05f, 0.05f}; // sky color
+            // no cosine term : embedded in cosine_weighted sampling
+            transmitted = v3_hadamard(transmitted, mat->diffuse);
+
+            // compute bounce ray
+            orig = itx.point;
+            dir = v3_in_basis(random_cosine_weighted(rng), itx.tangent1, itx.tangent2, itx.normal);
+        } else {
+            v3 sky = {.1f, .1f, .1f};
+            result = v3_add(result, v3_hadamard(transmitted, sky));
+            break;
+        }
     }
+    return result;
 }
 
 Sphere plane(v3 origin, v3 normal)
@@ -329,11 +345,13 @@ int worker_func(void* ptr)
     u32 samples_per_pixel = 16;
     u32 max_bounce_count = 3;
 
+    u32 rng = rand();
+
     while (queue->next_work_item < queue->item_count) {
-        WorkItem* item = &queue->items[queue->next_work_item++];
+        u32 item_index = FETCH_ADD(&queue->next_work_item, 1);
+        WorkItem* item = &queue->items[item_index];
 
-        printf("Tile %u %u -> %u %u\n", item->x_min, item->y_min, item->x_max, item->y_max);
-
+        u32 traced_count = 0;
         for (u32 y = item->y_min; y < item->y_max; y++) {
             for (u32 x = item->x_min; x < item->x_max; x++) {
                 u8* px = &item->image.pixels[y * item->image.stride + x * item->image.bytes_per_pixel];
@@ -346,7 +364,10 @@ int worker_func(void* ptr)
 
                 v3 col = {};
                 for (u32 i = 0; i < samples_per_pixel; i++) {
-                    col = v3_add(col, trace_ray(item->world, ray_orig, ray_dir, max_bounce_count));
+                    u32 bounce_count;
+                    v3 dcol = trace_ray(item->world, &rng, ray_orig, ray_dir, max_bounce_count, &bounce_count);
+                    col = v3_add(col, dcol);
+                    traced_count += bounce_count;
                 }
 
                 *px++ = 255 * linear_to_srgb(col.x / samples_per_pixel);
@@ -355,6 +376,8 @@ int worker_func(void* ptr)
                 *px++ = 0xFF;
             }
         }
+
+        FETCH_ADD(&item->world->traced_ray_count, traced_count);
     }
 
     return 0;
@@ -362,7 +385,13 @@ int worker_func(void* ptr)
 
 int main(int argc, const char* argv[])
 {
-    Image img = alloc_image(640, 480);
+    if (argc < 2) {
+        return 1;
+    }
+
+    srand(time(0));
+
+    Image img = alloc_image(1280, 960);
 
     World* world = malloc(sizeof(World));
     *world = (World){};
@@ -371,7 +400,7 @@ int main(int argc, const char* argv[])
     world->materials[1].emission = v3_scale(20.0f, (v3){1.f, 1.0f, 1.0f});
     world->materials[2].diffuse = (v3){.9f, .9f, .9f};
 
-    world->sphere_count = 7;
+    world->sphere_count = 5;
     world->spheres[0].center = (v3){.0f, .0f, 1.5f};
     world->spheres[0].radius = 1.5f;
     world->spheres[0].material = &world->materials[0];
@@ -397,7 +426,7 @@ int main(int argc, const char* argv[])
     world->spheres[6] = plane((v3){0.0f, 0.0f, 8.0f}, (v3){0.0f, 0.0f, -1.0f});
     world->spheres[6].material = &world->materials[2];
 
-    u32 tile_width = 64;
+    u32 tile_width = 256;
     u32 tile_height = tile_width;
 
     u32 x_tile_count = (img.width + tile_width - 1) / tile_width;
@@ -434,7 +463,7 @@ int main(int argc, const char* argv[])
     }
     ASSERT(items_queued == queue.item_count);
 
-    const u32 worker_count = 1;
+    const u32 worker_count = atoi(argv[1]);
     thrd_t workers[worker_count];
 
     clock_t begin = clock();
