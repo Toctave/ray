@@ -1,8 +1,8 @@
-#include <math.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <tgmath.h>
 #include <threads.h>
 #include <time.h>
 
@@ -132,7 +132,7 @@ float v3_norm_squared(v3 u)
 
 float v3_norm(v3 u)
 {
-    return sqrtf(v3_norm_squared(u));
+    return sqrt(v3_norm_squared(u));
 }
 
 v3 v3_normalized(v3 u)
@@ -197,7 +197,7 @@ b32 find_intersect(const World* world, v3 orig, v3 dir, Intersect* intersect)
             continue;
         }
 
-        float sqrt_disc = sqrtf(disc);
+        float sqrt_disc = sqrt(disc);
         float t = (-b - sqrt_disc) / 2.0f;
         if (t > 0.0f && t < intersect->t) {
             v3 point = v3_add(orig, v3_scale(t, dir));
@@ -237,19 +237,22 @@ u32 random_u32(u32* state)
 
 float random_float(u32* state)
 {
-    return (float)random_u32(state) / UINT32_MAX;
+    return (float)random_u32(state) / (float)UINT32_MAX;
+}
+
+void random_uniform_circle(u32* rng, float* x, float* y)
+{
+    do {
+        *x = random_float(rng);
+        *y = random_float(rng);
+    } while ((*x - .5f) * (*x - .5f) + (*y - .5f) * (*y - .5f) >= .5f * .5f);
 }
 
 v3 random_cosine_weighted(u32* rng)
 {
-    float theta = random_float(rng) * M_PI * 2.0f;
-    float u = random_float(rng);
-    float r = sqrtf(u); // homogeneize
-
     v3 res;
-    res.x = r * cosf(theta);
-    res.y = r * sinf(theta);
-    res.z = sqrtf(1.0f - res.x * res.x - res.y * res.y);
+    random_uniform_circle(rng, &res.x, &res.y);
+    res.z = sqrt(1.0f - res.x * res.x - res.y * res.y);
 
     return res;
 }
@@ -295,20 +298,16 @@ Sphere plane(v3 origin, v3 normal)
     };
 }
 
-v3 camera_ray_dir(Image img, v3 cam_up, v3 cam_dir, float fov_deg, u32 x, u32 y)
+v3 camera_ray_dir(v3 cam_up, v3 cam_dir, float fov_deg, float dx, float dy)
 {
     ASSERT_V3_NORMALIZED(cam_dir, 1.0e-3f);
-
-    float cam_ratio = (float)img.width / img.height;
-    float dx = cam_ratio * ((float)x / img.width * 2.0f - 1.0f);
-    float dy = -((float)y / img.height * 2.0f - 1.0f);
 
     // dir = -z
     v3 cam_x = v3_normalized(v3_cross(cam_dir, cam_up));
     v3 cam_y = v3_cross(cam_x, cam_dir);
 
     float fov_rad = M_PI * fov_deg / 180.0f;
-    float z = 1.0f / tanf(fov_rad * .5f);
+    float z = 1.0f / tan(fov_rad * .5f);
     v3 ray = v3_add(v3_add(v3_scale(dx, cam_x), v3_scale(dy, cam_y)), v3_scale(z, cam_dir));
 
     return v3_normalized(ray);
@@ -329,7 +328,7 @@ Image alloc_image(u32 width, u32 height)
 
 float linear_to_srgb(float val)
 {
-    return val > 1.0f ? 1.0f : powf(val, 1.0f / 2.2f);
+    return val > 1.0f ? 1.0f : pow(val, 1.0f / 2.2f);
 }
 
 int worker_func(void* ptr)
@@ -342,7 +341,7 @@ int worker_func(void* ptr)
     v3 cam_dir = v3_normalized(v3_sub(cam_target, cam_orig));
     float cam_fov = 60.0f;
 
-    u32 samples_per_pixel = 16;
+    u32 samples_per_pixel = 64;
     u32 max_bounce_count = 3;
 
     u32 rng = rand();
@@ -351,13 +350,18 @@ int worker_func(void* ptr)
         u32 item_index = FETCH_ADD(&queue->next_work_item, 1);
         WorkItem* item = &queue->items[item_index];
 
+        float cam_ratio = (float)item->image.width / item->image.height;
+
         u32 traced_count = 0;
         for (u32 y = item->y_min; y < item->y_max; y++) {
             for (u32 x = item->x_min; x < item->x_max; x++) {
                 u8* px = &item->image.pixels[y * item->image.stride + x * item->image.bytes_per_pixel];
 
+                float sample_x = cam_ratio * ((x + random_float(&rng)) / item->image.width * 2.0f - 1.0f);
+                float sample_y = -((y + random_float(&rng)) / item->image.height * 2.0f - 1.0f);
+
                 v3 ray_orig = cam_orig;
-                v3 ray_dir = camera_ray_dir(item->image, up, cam_dir, cam_fov, x, y);
+                v3 ray_dir = camera_ray_dir(up, cam_dir, cam_fov, sample_x, sample_y);
 
                 ASSERT_V3_NORMALIZED(cam_dir, 1.0e-3f);
                 ASSERT_V3_NORMALIZED(ray_dir, 1.0e-3f);
@@ -383,6 +387,14 @@ int worker_func(void* ptr)
     return 0;
 }
 
+u64 get_nanoseconds()
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
+}
+
 int main(int argc, const char* argv[])
 {
     if (argc < 2) {
@@ -391,7 +403,7 @@ int main(int argc, const char* argv[])
 
     srand(time(0));
 
-    Image img = alloc_image(1280, 960);
+    Image img = alloc_image(1920, 1080);
 
     World* world = malloc(sizeof(World));
     *world = (World){};
@@ -426,8 +438,8 @@ int main(int argc, const char* argv[])
     world->spheres[6] = plane((v3){0.0f, 0.0f, 8.0f}, (v3){0.0f, 0.0f, -1.0f});
     world->spheres[6].material = &world->materials[2];
 
-    u32 tile_width = 256;
-    u32 tile_height = tile_width;
+    u32 tile_width = 64;
+    u32 tile_height = 64;
 
     u32 x_tile_count = (img.width + tile_width - 1) / tile_width;
     u32 y_tile_count = (img.height + tile_height - 1) / tile_height;
@@ -466,7 +478,7 @@ int main(int argc, const char* argv[])
     const u32 worker_count = atoi(argv[1]);
     thrd_t workers[worker_count];
 
-    clock_t begin = clock();
+    u64 begin = get_nanoseconds();
 
     for (u32 i = 0; i < worker_count; i++) {
         int err = thrd_create(&workers[i], worker_func, &queue);
@@ -485,9 +497,9 @@ int main(int argc, const char* argv[])
         }
     }
 
-    clock_t end = clock();
+    u64 end = get_nanoseconds();
 
-    u32 elapsed_ms = 1000 * (end - begin) / CLOCKS_PER_SEC;
+    u32 elapsed_ms = (end - begin) / (1000ull * 1000ull);
     printf("Took %u ms, traced %lu rays, %f us per ray\n",
            elapsed_ms,
            world->traced_ray_count,
