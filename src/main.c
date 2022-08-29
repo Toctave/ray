@@ -240,12 +240,24 @@ float random_float(u32* state)
     return (float)random_u32(state) / (float)UINT32_MAX;
 }
 
-void random_uniform_circle(u32* rng, float* x, float* y)
+void random_uniform_circle(u32* rng, float* x_out, float* y_out)
 {
+#if 0
+    float x, y;
     do {
-        *x = random_float(rng);
-        *y = random_float(rng);
-    } while ((*x - .5f) * (*x - .5f) + (*y - .5f) * (*y - .5f) >= .5f * .5f);
+        x = 2.0f * random_float(rng) - 1.0f;
+        y = 2.0f * random_float(rng) - 1.0f;
+    } while (x * x + y * y >= 1.0f);
+
+    *x_out = x;
+    *y_out = y;
+#else
+    float r = sqrt(random_float(rng));
+    float theta = 2.0f * M_PI * random_float(rng);
+
+    *x_out = r * cos(theta);
+    *y_out = r * sin(theta);
+#endif
 }
 
 v3 random_cosine_weighted(u32* rng)
@@ -348,6 +360,9 @@ int worker_func(void* ptr)
 
     while (queue->next_work_item < queue->item_count) {
         u32 item_index = FETCH_ADD(&queue->next_work_item, 1);
+        printf("%d%%... ", 100 * queue->next_work_item / queue->item_count);
+        fflush(stdout);
+
         WorkItem* item = &queue->items[item_index];
 
         float cam_ratio = (float)item->image.width / item->image.height;
