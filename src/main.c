@@ -52,7 +52,7 @@ typedef struct {
     v3 tangent2; // (t1, t2, normal) is right-handed
     v3 normal;
     float t;
-    u32 object_index;
+    u32 material_index;
 } Intersect;
 
 typedef struct {
@@ -63,7 +63,7 @@ typedef struct {
 typedef struct {
     v3 center;
     float radius;
-    Material* material;
+    u32 material_index;
 } Sphere;
 
 typedef struct {
@@ -204,7 +204,7 @@ b32 find_intersect(const World* world, v3 orig, v3 dir, Intersect* intersect)
             v3 cp = v3_sub(point, sphere->center);
 
             intersect->t = t;
-            intersect->object_index = i;
+            intersect->material_index = sphere->material_index;
             intersect->normal = v3_normalized(cp);
 
             res = 1;
@@ -282,7 +282,7 @@ v3 trace_ray(const World* world, u32* rng, v3 orig, v3 dir, u32 max_depth, u32* 
         if (find_intersect(world, orig, dir, &itx)) {
             (*bounces)++;
 
-            Material* mat = world->spheres[itx.object_index].material;
+            const Material* mat = &world->materials[itx.material_index];
 
             result = v3_add(result, v3_hadamard(transmitted, mat->emission));
 
