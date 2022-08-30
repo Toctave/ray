@@ -1,0 +1,257 @@
+#pragma once
+
+#include "base_types.h"
+#include "math.h"
+#include <assert.h>
+
+#define SIMD_LANES 1
+
+#if SIMD_LANES == 1
+
+typedef float w_float;
+typedef u32 w_u32;
+
+typedef union {
+    struct {
+        w_float x;
+        w_float y;
+        w_float z;
+    };
+    w_float co[3];
+} w_v3;
+
+static inline w_u32 w_u32_broadcast(u32 base)
+{
+    return base;
+}
+
+static inline float w_float_broadcast(float val)
+{
+    return val;
+}
+
+static inline w_v3 w_v3_broadcast(v3 val)
+{
+    return (w_v3){
+        w_float_broadcast(val.x),
+        w_float_broadcast(val.y),
+        w_float_broadcast(val.z),
+    };
+}
+
+static inline w_u32 w_u32_or(w_u32 lhs, w_u32 rhs)
+{
+    return lhs | rhs;
+}
+
+static inline w_u32 w_u32_and(w_u32 lhs, w_u32 rhs)
+{
+    return lhs & rhs;
+}
+
+static inline w_u32 w_u32_add(w_u32 lhs, w_u32 rhs)
+{
+    return lhs + rhs;
+}
+
+static inline w_float w_float_add(w_float lhs, w_float rhs)
+{
+    return lhs + rhs;
+}
+
+static inline w_float w_float_sub(w_float lhs, w_float rhs)
+{
+    return lhs - rhs;
+}
+
+static inline w_float w_float_mul(w_float lhs, w_float rhs)
+{
+    return lhs * rhs;
+}
+
+static inline w_float w_float_div(w_float lhs, w_float rhs)
+{
+    return lhs / rhs;
+}
+
+static inline w_float w_sqrt(w_float u)
+{
+    return sqrtf(u);
+}
+
+static inline w_v3 w_v3_add(w_v3 lhs, w_v3 rhs)
+{
+    w_v3 result = {
+        .x = w_float_add(lhs.x, rhs.x),
+        .y = w_float_add(lhs.y, rhs.y),
+        .z = w_float_add(lhs.z, rhs.z),
+    };
+
+    return result;
+}
+
+static inline w_v3 w_v3_sub(w_v3 lhs, w_v3 rhs)
+{
+    w_v3 result = {
+        .x = w_float_sub(lhs.x, rhs.x),
+        .y = w_float_sub(lhs.y, rhs.y),
+        .z = w_float_sub(lhs.z, rhs.z),
+    };
+
+    return result;
+}
+
+static inline w_v3 w_v3_hadamard(w_v3 lhs, w_v3 rhs)
+{
+    w_v3 result = {
+        .x = w_float_mul(lhs.x, rhs.x),
+        .y = w_float_mul(lhs.y, rhs.y),
+        .z = w_float_mul(lhs.z, rhs.z),
+    };
+
+    return result;
+}
+
+static inline w_float w_v3_dot(w_v3 lhs, w_v3 rhs)
+{
+    // TODO(octave) : use madds here
+    return w_float_add(w_float_add(w_float_mul(lhs.x, rhs.x), w_float_mul(lhs.y, rhs.y)), w_float_mul(lhs.z, rhs.z));
+}
+
+static inline w_v3 w_v3_scale(w_float lhs, w_v3 rhs)
+{
+    w_v3 result = {
+        .x = w_float_mul(lhs, rhs.x),
+        .y = w_float_mul(lhs, rhs.y),
+        .z = w_float_mul(lhs, rhs.z),
+    };
+
+    return result;
+}
+
+static inline w_v3 w_v3_div(w_v3 lhs, w_float rhs)
+{
+    w_v3 result = {
+        .x = w_float_div(lhs.x, rhs),
+        .y = w_float_div(lhs.y, rhs),
+        .z = w_float_div(lhs.z, rhs),
+    };
+
+    return result;
+}
+
+static inline w_v3 w_v3_normalized(w_v3 v)
+{
+    w_float squared_norm = w_v3_dot(v, v);
+    w_float norm = w_sqrt(squared_norm);
+
+    return w_v3_div(v, norm);
+}
+
+static inline w_v3 w_v3_cross(w_v3 lhs, w_v3 rhs)
+{
+    w_v3 result;
+    result.x = w_float_sub(w_float_mul(lhs.y, rhs.z), w_float_mul(lhs.z, rhs.y));
+    result.y = w_float_sub(w_float_mul(lhs.z, rhs.x), w_float_mul(lhs.x, rhs.z));
+    result.z = w_float_sub(w_float_mul(lhs.x, rhs.y), w_float_mul(lhs.y, rhs.x));
+
+    return result;
+}
+
+static inline void w_u32_conditional_assign(w_u32 mask, w_u32* lhs, w_u32 rhs)
+{
+    *lhs = (*lhs & ~mask) | (rhs & mask);
+}
+
+static inline w_float w_u32_to_float(w_u32 u)
+{
+    union _ {
+        w_u32 u;
+        w_float f;
+    };
+
+    union _ pun;
+    pun.u = u;
+    return pun.f;
+}
+
+static inline w_u32 w_float_to_u32(w_float f)
+{
+    union _ {
+        w_u32 u;
+        w_float f;
+    };
+
+    union _ pun;
+    pun.f = f;
+    return pun.u;
+}
+
+static inline void w_float_conditional_assign(w_u32 mask, w_float* lhs, w_float rhs)
+{
+    w_u32 rhs_u = w_float_to_u32(rhs);
+    w_u32 lhs_u = w_float_to_u32(*lhs);
+    w_u32_conditional_assign(mask, &lhs_u, rhs_u);
+    *lhs = w_u32_to_float(lhs_u);
+}
+
+static inline w_float w_float_masked(w_u32 mask, w_float rhs)
+{
+    w_u32 rhs_u = w_float_to_u32(rhs);
+    rhs_u = w_u32_and(mask, rhs_u);
+
+    return w_u32_to_float(rhs_u);
+}
+
+static inline void w_v3_conditional_assign(w_u32 mask, w_v3* lhs, w_v3 rhs)
+{
+    w_float_conditional_assign(mask, &lhs->x, rhs.x);
+    w_float_conditional_assign(mask, &lhs->y, rhs.y);
+    w_float_conditional_assign(mask, &lhs->z, rhs.z);
+}
+
+static inline w_v3 w_v3_in_basis(w_v3 coords, w_v3 x, w_v3 y, w_v3 z)
+{
+    return w_v3_add(w_v3_add(w_v3_scale(coords.x, x), w_v3_scale(coords.y, y)), w_v3_scale(coords.z, z));
+}
+
+static inline u32 w_u32_horizontal_add(w_u32 v)
+{
+    return v;
+}
+
+static inline float w_float_horizontal_add(w_float v)
+{
+    return v;
+}
+
+static inline v3 w_v3_horizontal_add(w_v3 v)
+{
+    v3 result = {
+        w_float_horizontal_add(v.x),
+        w_float_horizontal_add(v.y),
+        w_float_horizontal_add(v.z),
+    };
+
+    return result;
+}
+
+static inline w_v3 w_v3_masked(w_u32 mask, w_v3 v)
+{
+    w_v3 result = {
+        w_float_masked(mask, v.x),
+        w_float_masked(mask, v.y),
+        w_float_masked(mask, v.z),
+    };
+
+    return result;
+}
+
+static inline b32 w_mask_is_zeroed(w_u32 mask)
+{
+    return !mask;
+}
+
+#else
+#error Only SIMD_LANES==1 supported
+#endif

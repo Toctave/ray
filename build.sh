@@ -1,5 +1,5 @@
 compiler=gcc
-flags="-O3 -g -Wall -Wextra -Wno-missing-braces"
+flags="-O3 -g -Wall -Wextra -Wno-missing-braces -std=gnu11"
 
 mkdir -p build
 cd build
