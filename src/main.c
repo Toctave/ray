@@ -334,7 +334,7 @@ v3 trace_ray(const World* world, w_u32* rng, w_v3 orig, w_v3 dir, u32 max_depth,
         dir = w_v3_in_basis(random_cosine_weighted(rng), itx.tangent1, itx.tangent2, itx.normal);
 
         // bail out if the whole lane is dead
-        if (w_mask_is_zeroed(ray_alive_mask)) {
+        if (!w_u32_horizontal_and(ray_alive_mask)) {
             break;
         }
     }
@@ -387,7 +387,7 @@ int worker_func(void* ptr)
     float cam_fov_rad = M_PI * cam_fov_deg / 180.0f;
     float cam_depth = 1.0f / tan(cam_fov_rad * .5f);
 
-    u32 samples_per_pixel = 640;
+    u32 samples_per_pixel = 16;
     u32 max_bounce_count = 10;
 
     u32 rng_seed[SIMD_LANES];
@@ -461,6 +461,14 @@ u64 get_nanoseconds()
     return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
 }
 
+void w_u32_print(w_u32 v)
+{
+    u32 vals[4];
+    w_u32_read(v, vals);
+
+    printf("%u %u %u %u\n", vals[0], vals[1], vals[2], vals[3]);
+}
+
 int main(int argc, const char* argv[])
 {
     if (argc < 2) {
@@ -484,22 +492,22 @@ int main(int argc, const char* argv[])
 
     Sphere spheres[] = {
         /* // main sphere */
-        {
-            .center = (v3){.0f, .0f, 1.5f},
-            .radius = 1.5f,
-            .material_index = 1,
-        },
+        /* { */
+        /*     .center = (v3){.0f, .0f, 1.5f}, */
+        /*     .radius = 1.5f, */
+        /*     .material_index = 1, */
+        /* }, */
         // light
         {
             .center = (v3){0.0f, 0.0f, 8.5f},
             .radius = .8f,
             .material_index = 2,
         },
-        plane((v3){.0f, .0f, .0f}, (v3){.0f, .0f, 1.0f}, 3),        // floor
-        plane((v3){0.0f, 0.0f, 10.0f}, (v3){0.0f, 0.0f, -1.0f}, 3), // ceiling
-        plane((v3){-5.0f, 0.0f, .0f}, (v3){1.0f, 0.0f, .0f}, 4),    // left wall
-        plane((v3){5.0f, 0.0f, .0f}, (v3){-1.0f, 0.0f, .0f}, 5),    // right wall
-        plane((v3){.0f, 5.0f, .0f}, (v3){.0f, -1.0f, .0f}, 3),      // back wall
+        /* plane((v3){.0f, .0f, .0f}, (v3){.0f, .0f, 1.0f}, 3),        // floor */
+        /* plane((v3){0.0f, 0.0f, 10.0f}, (v3){0.0f, 0.0f, -1.0f}, 3), // ceiling */
+        /* plane((v3){-5.0f, 0.0f, .0f}, (v3){1.0f, 0.0f, .0f}, 4),    // left wall */
+        /* plane((v3){5.0f, 0.0f, .0f}, (v3){-1.0f, 0.0f, .0f}, 5),    // right wall */
+        plane((v3){.0f, 5.0f, .0f}, (v3){.0f, -1.0f, .0f}, 3), // back wall
     };
 
     world.materials = materials;
