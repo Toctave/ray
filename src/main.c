@@ -21,6 +21,7 @@
 typedef struct {
     v3 emission;
     v3 diffuse;
+    float polish; // 0 = mirror, 1 = diffuse
 } Material;
 
 typedef struct {
@@ -270,6 +271,21 @@ w_v3 random_cosine_weighted(w_u32* rng)
     return res;
 }
 
+w_v3 w_v3_mirrored(w_v3 dir, w_v3 normal)
+{
+    w_float n = w_v3_dot(dir, normal);
+    //u = n * N + t * T;
+    // r = -n*N + t* T = u - 2 * n * N
+    w_v3 res = w_v3_add(dir, w_v3_scale(w_float_mul(w_float_broadcast(-2.0f), n), normal));
+    return res;
+}
+
+w_v3 w_v3_lerp(w_float lambda, w_v3 u, w_v3 v)
+{
+    w_float oml = w_float_sub(w_float_broadcast(1.0f), lambda);
+    return w_v3_add(w_v3_scale(oml, u), w_v3_scale(lambda, v));
+}
+
 v3 trace_ray(const World* world, w_u32* rng, w_v3 orig, w_v3 dir, u32 max_depth, u32* bounces)
 {
     w_v3 result = {};
@@ -290,6 +306,7 @@ v3 trace_ray(const World* world, w_u32* rng, w_v3 orig, w_v3 dir, u32 max_depth,
         // TODO(octave) : alignment!
         float emissions[3][SIMD_LANES];
         float diffuses[3][SIMD_LANES];
+        float polishes[SIMD_LANES];
 
         for (u32 lane = 0; lane < SIMD_LANES; lane++) {
             u32 mat_index = mat_indices[lane];
@@ -297,12 +314,12 @@ v3 trace_ray(const World* world, w_u32* rng, w_v3 orig, w_v3 dir, u32 max_depth,
                 emissions[i][lane] = world->materials[mat_index].emission.co[i];
                 diffuses[i][lane] = world->materials[mat_index].diffuse.co[i];
             }
+            polishes[lane] = world->materials[mat_index].polish;
         }
 
-        // TODO(octave) : actual n-way load
         w_v3 emission = w_v3_write(emissions);
         w_v3 diffuse = w_v3_write(diffuses);
-        // --------
+        w_float polish = w_float_write(polishes);
 
         emission = w_v3_masked(ray_alive_mask, emission);
 
@@ -316,7 +333,13 @@ v3 trace_ray(const World* world, w_u32* rng, w_v3 orig, w_v3 dir, u32 max_depth,
 
         // compute bounce ray
         orig = itx.point;
-        dir = w_v3_in_basis(random_cosine_weighted(rng), itx.tangent1, itx.tangent2, itx.normal);
+        w_v3 mirror = w_v3_mirrored(dir, itx.normal);
+        w_v3 rnd = w_v3_in_basis(random_cosine_weighted(rng), itx.tangent1, itx.tangent2, itx.normal);
+        dir = w_v3_lerp(polish, rnd, mirror);
+        dir = w_v3_normalized(dir);
+
+        // bounceT = -dirT
+        // bounceN = dirN
 
         // bail out if the whole lane is dead
         if (!w_u32_horizontal_and(ray_alive_mask)) {
@@ -331,7 +354,7 @@ v3 trace_ray(const World* world, w_u32* rng, w_v3 orig, w_v3 dir, u32 max_depth,
 
 Sphere plane(v3 origin, v3 normal, u32 material_index)
 {
-    float radius = 100000.0f;
+    float radius = 10000.0f;
     return (Sphere){
         .center = v3_sub(origin, v3_scale(radius, normal)),
         .radius = radius,
@@ -398,9 +421,6 @@ int worker_func(void* ptr)
 
                     w_float sample_x = w_float_add(w_float_broadcast(sx * x - cam_ratio), dx);
                     w_float sample_y = w_float_add(w_float_broadcast(sy * y + 1.0f), dy);
-
-                    /* w_float sample_x = w_float_broadcast(sx * (x + .5f) - cam_ratio); */
-                    /* w_float sample_y = w_float_broadcast(sy * (y + .5f) + 1.0f); */
 
                     w_v3 ray_orig = w_v3_broadcast(cam_orig);
 
@@ -516,11 +536,11 @@ int main(int argc, const char* argv[])
     srand(time(0));
 
     Config config = {
-        .img_width = 2560,
-        .img_height = 1440,
+        .img_width = 1024,
+        .img_height = 1024,
         .worker_count = 12,
         .max_bounce_count = 10,
-        .samples_per_pixel = 65536,
+        .samples_per_pixel = 32,
     };
 
     Image img = alloc_image(config.img_width, config.img_height);
@@ -528,32 +548,28 @@ int main(int argc, const char* argv[])
     World world = {};
 
     Material materials[] = {
-        {.diffuse = {}, .emission = v3_scale(.1f, (v3){1.f, 1.0f, 1.0f})},    // sky
-        {.diffuse = (v3){.3f, .3f, .3f}},                                     // gray
-        {.diffuse = {}, .emission = v3_scale(20.0f, (v3){1.0f, 1.0f, 1.0f})}, // light
-        {.diffuse = (v3){.9f, .9f, .9f}},                                     // white
-        {.diffuse = (v3){.9f, .2f, .2f}},                                     // red
-        {.diffuse = (v3){.2f, .9f, .9f}},                                     // blue
+        [0] = {.diffuse = {}, .emission = v3_scale(.0f, (v3){1.f, 1.0f, 1.0f})},  // sky
+        [1] = {.diffuse = (v3){.3f, .3f, .3f}},                                   // gray
+        [2] = {.diffuse = {}, .emission = v3_scale(2.0f, (v3){1.0f, 1.0f, .7f})}, // light
+        [3] = {.diffuse = (v3){.9f, .9f, .9f}},                                   // white
+        [4] = {.diffuse = (v3){.9f, .2f, .2f}},                                   // red
+        [5] = {.diffuse = (v3){.2f, .9f, .9f}},                                   // blue
+        [6] = {.diffuse = (v3){.9f, .6f, .1f}},                                   // yellow
+        [7] = {.diffuse = (v3){.9f, .9f, .9f}, .polish = .99f},                   // mirror
     };
 
     Sphere spheres[] = {
-        /* // main sphere */
-        {
-            .center = (v3){.0f, .0f, 1.5f},
-            .radius = 1.5f,
-            .material_index = 1,
-        },
+        // main spheres
+        {.center = (v3){-2.0f, -1.0f, 1.5f}, .radius = 1.5f, .material_index = 7},
+        {.center = (v3){2.0f, .0f, 2.5f}, .radius = 2.5f, .material_index = 6},
         // light
-        {
-            .center = (v3){0.0f, 0.0f, 8.5f},
-            .radius = .8f,
-            .material_index = 2,
-        },
+        {.center = (v3){0.0f, 0.0f, 12.0f}, .radius = 4.f, .material_index = 2},
         plane((v3){.0f, .0f, .0f}, (v3){.0f, .0f, 1.0f}, 3),        // floor
         plane((v3){0.0f, 0.0f, 10.0f}, (v3){0.0f, 0.0f, -1.0f}, 3), // ceiling
         plane((v3){-5.0f, 0.0f, .0f}, (v3){1.0f, 0.0f, .0f}, 4),    // left wall
         plane((v3){5.0f, 0.0f, .0f}, (v3){-1.0f, 0.0f, .0f}, 5),    // right wall
-        plane((v3){.0f, 5.0f, .0f}, (v3){.0f, -1.0f, .0f}, 3),      // back wall
+        plane((v3){.0f, 5.0f, .0f}, (v3){.0f, -1.0f, .0f}, 7),      // back wall
+        plane((v3){.0f, -5.0f, .0f}, (v3){.0f, 1.0f, .0f}, 7),      // front wall
     };
 
     world.materials = materials;
