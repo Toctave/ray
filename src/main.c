@@ -12,32 +12,11 @@
 #include <unistd.h>
 
 #include "base_types.h"
+#include "my_assert.h"
 #include "simd.h"
 #include "stb_image_write.h"
 
 #define FETCH_ADD(ptr, val) __atomic_fetch_add(ptr, val, __ATOMIC_RELAXED)
-
-#if 1
-
-#define ASSERT(expr)                                                                                                   \
-    do {                                                                                                               \
-        if (!(expr)) {                                                                                                 \
-            fprintf(stderr, "%s:%d: Assertion %s failed\n", __FILE__, __LINE__, #expr);                                \
-            raise(SIGTRAP);                                                                                            \
-        }                                                                                                              \
-    } while (0)
-
-#else
-
-#define ASSERT(expr)
-
-#endif
-
-#define ASSERT_ZERO(a, tol) ASSERT(fabs(a) < tol)
-
-#define ASSERT_EQ(a, b, tol) ASSERT(fabs(a - b) < tol * fabs(b))
-
-#define ASSERT_V3_NORMALIZED(v, tol) ASSERT_EQ(v3_norm(v), 1.0f, tol)
 
 typedef struct {
     v3 emission;
@@ -78,9 +57,6 @@ typedef struct {
 } Intersect;
 
 typedef struct {
-    Image image;
-    World* world;
-
     u32 x_min;
     u32 x_max;
     u32 y_min;
@@ -88,9 +64,23 @@ typedef struct {
 } WorkItem;
 
 typedef struct {
+    u32 img_width;
+    u32 img_height;
+    u32 worker_count;
+    u32 samples_per_pixel;
+    u32 max_bounce_count;
+} Config;
+
+typedef struct {
     WorkItem* items;
     u32 item_count;
     u32 next_work_item;
+
+    u32 retired_tiles;
+
+    Image image;
+    World* world;
+    Config config;
 } WorkQueue;
 
 v3 v3_sub(v3 u, v3 v)
@@ -200,10 +190,6 @@ w_u32 find_intersect(const World* world, w_v3 orig, w_v3 dir, Intersect* interse
         w_v3 hit_point = w_v3_add(orig, w_v3_scale(t, dir));
         w_v3 normal = w_v3_normalized(w_v3_sub(hit_point, center));
 
-        /* if (assign_mask) { */
-        /* printf("normal : %f %f %f\n", normal.x, normal.y, normal.z); */
-        /* } */
-
         w_float_conditional_assign(assign_mask, &intersect->t, t);
         w_v3_conditional_assign(assign_mask, &intersect->normal, normal);
         w_v3_conditional_assign(assign_mask, &intersect->point, hit_point);
@@ -216,10 +202,9 @@ w_u32 find_intersect(const World* world, w_v3 orig, w_v3 dir, Intersect* interse
         w_v3_normalized(w_v3_cross(dir, intersect->normal)); // TODO(octave) : fallback for orthogonal hits
     intersect->tangent1 = w_v3_cross(intersect->tangent2, intersect->normal);
 
-
-    /* ASSERT_V3_NORMALIZED(intersect->normal, 1.0e-3f); */
-    /* ASSERT_V3_NORMALIZED(intersect->tangent2, 1.0e-3f); */
-    /* ASSERT_V3_NORMALIZED(intersect->tangent1, 1.0e-3f); */
+    ASSERT_W_V3_NORMALIZED(res, intersect->normal, 1.0e-3f);
+    ASSERT_W_V3_NORMALIZED(res, intersect->tangent2, 1.0e-3f);
+    ASSERT_W_V3_NORMALIZED(res, intersect->tangent1, 1.0e-3f);
 
     return res;
 }
@@ -236,21 +221,21 @@ w_u32 w_u32_xorshift(w_u32* state)
     return *state;
 }
 
-w_float random_float(w_u32* state, float amplitude)
+w_float random_float_bidir(w_u32* state, float amplitude)
 {
-    w_float s = w_float_broadcast(amplitude * 0x1.0p-32);
+    w_float s = w_float_broadcast(amplitude * 0x1.0p-31);
 
     w_u32 rnd = w_u32_xorshift(state);
-    w_float x = w_u32_cast_float(rnd); // cast to float
-    x = w_float_mul(x, s);             // divide by 2^32, multiply by amplitude
+    w_float x = w_s32_cast_float(rnd); // cast to float, signed : range -2^31, 2^31-1
+    x = w_float_mul(x, s);             // divide by 2^31, multiply by amplitude
 
     return x;
 }
 
-w_float random_float_bidir(w_u32* state, float amplitude)
+w_float random_float(w_u32* state, float amplitude)
 {
-    w_float x = random_float(state, 2.0f * amplitude);
-    x = w_float_sub(x, w_float_broadcast(amplitude)); // subtract to center around 0
+    w_float x = random_float_bidir(state, .5f * amplitude);
+    x = w_float_add(x, w_float_broadcast(.5f * amplitude));
 
     return x;
 }
@@ -386,9 +371,7 @@ int worker_func(void* ptr)
     float cam_fov_deg = 60.0f;
     float cam_fov_rad = M_PI * cam_fov_deg / 180.0f;
     float cam_depth = 1.0f / tan(cam_fov_rad * .5f);
-
-    u32 samples_per_pixel = 16;
-    u32 max_bounce_count = 10;
+    float cam_ratio = (float)queue->image.width / queue->image.height;
 
     u32 rng_seed[SIMD_LANES];
     for (u32 i = 0; i < SIMD_LANES; i++) {
@@ -398,22 +381,17 @@ int worker_func(void* ptr)
 
     while (queue->next_work_item < queue->item_count) {
         u32 item_index = FETCH_ADD(&queue->next_work_item, 1);
-        printf("%d%%...\r", 100 * queue->next_work_item / queue->item_count);
-        fflush(stdout);
-
         WorkItem* item = &queue->items[item_index];
-
-        float cam_ratio = (float)item->image.width / item->image.height;
 
         u32 traced_count = 0;
         for (u32 y = item->y_min; y < item->y_max; y++) {
             for (u32 x = item->x_min; x < item->x_max; x++) {
-                u8* px = &item->image.pixels[y * item->image.stride + x * item->image.bytes_per_pixel];
+                u8* px = &queue->image.pixels[y * queue->image.stride + x * queue->image.bytes_per_pixel];
 
                 v3 col = {};
-                for (u32 i = 0; i < samples_per_pixel / SIMD_LANES; i++) {
-                    float sx = 2.0f * cam_ratio / item->image.width;
-                    float sy = -2.0f / item->image.height;
+                for (u32 i = 0; i < queue->config.samples_per_pixel / SIMD_LANES; i++) {
+                    float sx = 2.0f * cam_ratio / queue->image.width;
+                    float sy = -2.0f / queue->image.height;
 
                     w_float dx = random_float(&rng, sx);
                     w_float dy = random_float(&rng, sy);
@@ -435,19 +413,27 @@ int worker_func(void* ptr)
                     ray_dir = w_v3_normalized(ray_dir);
 
                     u32 bounce_count;
-                    v3 dcol = trace_ray(item->world, &rng, ray_orig, ray_dir, max_bounce_count, &bounce_count);
+                    v3 dcol =
+                        trace_ray(queue->world, &rng, ray_orig, ray_dir, queue->config.max_bounce_count, &bounce_count);
                     col = v3_add(col, dcol);
                     traced_count += bounce_count;
                 }
 
-                *px++ = 255 * linear_to_srgb(col.x / samples_per_pixel);
-                *px++ = 255 * linear_to_srgb(col.y / samples_per_pixel);
-                *px++ = 255 * linear_to_srgb(col.z / samples_per_pixel);
+                *px++ = 255 * linear_to_srgb(col.x / queue->config.samples_per_pixel);
+                *px++ = 255 * linear_to_srgb(col.y / queue->config.samples_per_pixel);
+                *px++ = 255 * linear_to_srgb(col.z / queue->config.samples_per_pixel);
                 *px++ = 0xFF;
             }
         }
 
-        FETCH_ADD(&item->world->traced_ray_count, traced_count);
+        FETCH_ADD(&queue->world->traced_ray_count, traced_count);
+        FETCH_ADD(&queue->retired_tiles, 1);
+
+        printf("Rendered tile %d/%d (%d%%) ...\r",
+               queue->retired_tiles,
+               queue->item_count,
+               100 * queue->retired_tiles / queue->item_count);
+        fflush(stdout);
     }
 
     return 0;
@@ -463,21 +449,81 @@ u64 get_nanoseconds()
 
 void w_u32_print(w_u32 v)
 {
-    u32 vals[4];
+    u32 vals[SIMD_LANES];
     w_u32_read(v, vals);
 
-    printf("%u %u %u %u\n", vals[0], vals[1], vals[2], vals[3]);
+    printf("[%u] ", SIMD_LANES);
+    for (u32 i = 0; i < SIMD_LANES; i++) {
+        printf("%u ", vals[i]);
+    }
+    printf("\n");
 }
+
+void w_float_print(w_float v)
+{
+    float vals[SIMD_LANES];
+    w_float_read(v, vals);
+
+    printf("[%u] ", SIMD_LANES);
+    for (u32 i = 0; i < SIMD_LANES; i++) {
+        printf("%f ", vals[i]);
+    }
+    printf("\n");
+}
+
+void test_rng()
+{
+    u32 rng_seed[SIMD_LANES];
+    for (u32 i = 0; i < SIMD_LANES; i++) {
+        rng_seed[i] = rand();
+    }
+    w_u32 rng = w_u32_write(rng_seed);
+
+    s32 hist_res = 10;
+    u32* histogram = calloc(hist_res, sizeof(u32));
+
+    u32 samples = 10000000;
+    for (u32 i = 0; i < samples / SIMD_LANES; i++) {
+        w_float x = random_float(&rng, 1.0f);
+        float xv[4];
+        w_float_read(x, xv);
+
+        for (u32 l = 0; l < SIMD_LANES; l++) {
+            s32 bucket = floor(xv[l] * hist_res);
+
+            if (bucket < 0) {
+                bucket = 0;
+            } else if (bucket >= hist_res) {
+                bucket = hist_res;
+            }
+
+            histogram[bucket]++;
+        }
+    }
+
+    for (s32 bucket = 0; bucket < hist_res; bucket++) {
+        printf("%f ", (float)histogram[bucket] / samples);
+    }
+
+    printf("\n");
+    free(histogram);
+}
+
+#define MAX_WORKER_COUNT 256
 
 int main(int argc, const char* argv[])
 {
-    if (argc < 2) {
-        return 1;
-    }
-
     srand(time(0));
 
-    Image img = alloc_image(256, 256);
+    Config config = {
+        .img_width = 2560,
+        .img_height = 1440,
+        .worker_count = 12,
+        .max_bounce_count = 10,
+        .samples_per_pixel = 65536,
+    };
+
+    Image img = alloc_image(config.img_width, config.img_height);
 
     World world = {};
 
@@ -492,22 +538,22 @@ int main(int argc, const char* argv[])
 
     Sphere spheres[] = {
         /* // main sphere */
-        /* { */
-        /*     .center = (v3){.0f, .0f, 1.5f}, */
-        /*     .radius = 1.5f, */
-        /*     .material_index = 1, */
-        /* }, */
+        {
+            .center = (v3){.0f, .0f, 1.5f},
+            .radius = 1.5f,
+            .material_index = 1,
+        },
         // light
         {
             .center = (v3){0.0f, 0.0f, 8.5f},
             .radius = .8f,
             .material_index = 2,
         },
-        /* plane((v3){.0f, .0f, .0f}, (v3){.0f, .0f, 1.0f}, 3),        // floor */
-        /* plane((v3){0.0f, 0.0f, 10.0f}, (v3){0.0f, 0.0f, -1.0f}, 3), // ceiling */
-        /* plane((v3){-5.0f, 0.0f, .0f}, (v3){1.0f, 0.0f, .0f}, 4),    // left wall */
-        /* plane((v3){5.0f, 0.0f, .0f}, (v3){-1.0f, 0.0f, .0f}, 5),    // right wall */
-        plane((v3){.0f, 5.0f, .0f}, (v3){.0f, -1.0f, .0f}, 3), // back wall
+        plane((v3){.0f, .0f, .0f}, (v3){.0f, .0f, 1.0f}, 3),        // floor
+        plane((v3){0.0f, 0.0f, 10.0f}, (v3){0.0f, 0.0f, -1.0f}, 3), // ceiling
+        plane((v3){-5.0f, 0.0f, .0f}, (v3){1.0f, 0.0f, .0f}, 4),    // left wall
+        plane((v3){5.0f, 0.0f, .0f}, (v3){-1.0f, 0.0f, .0f}, 5),    // right wall
+        plane((v3){.0f, 5.0f, .0f}, (v3){.0f, -1.0f, .0f}, 3),      // back wall
     };
 
     world.materials = materials;
@@ -521,6 +567,9 @@ int main(int argc, const char* argv[])
     u32 y_tile_count = (img.height + tile_height - 1) / tile_height;
 
     WorkQueue queue = {};
+    queue.world = &world;
+    queue.image = img;
+    queue.config = config;
     queue.item_count = x_tile_count * y_tile_count;
     queue.items = malloc(sizeof(WorkItem) * queue.item_count);
 
@@ -541,8 +590,6 @@ int main(int argc, const char* argv[])
 
             WorkItem* item = &queue.items[items_queued++];
 
-            item->world = &world;
-            item->image = img;
             item->x_min = x_min;
             item->x_max = x_max;
             item->y_min = y_min;
@@ -551,12 +598,15 @@ int main(int argc, const char* argv[])
     }
     ASSERT(items_queued == queue.item_count);
 
-    const u32 worker_count = atoi(argv[1]);
-    thrd_t workers[worker_count];
+    thrd_t workers[MAX_WORKER_COUNT];
+    if (config.worker_count > MAX_WORKER_COUNT) {
+        config.worker_count = MAX_WORKER_COUNT;
+        fprintf(stderr, "Cannot have more than %u worker threads, clamping.\n", MAX_WORKER_COUNT);
+    }
 
     u64 begin = get_nanoseconds();
 
-    for (u32 i = 0; i < worker_count; i++) {
+    for (u32 i = 0; i < config.worker_count; i++) {
         int err = thrd_create(&workers[i], worker_func, &queue);
 
         if (err != thrd_success) {
@@ -564,7 +614,7 @@ int main(int argc, const char* argv[])
         }
     }
 
-    for (u32 i = 0; i < worker_count; i++) {
+    for (u32 i = 0; i < config.worker_count; i++) {
         int res;
         int err = thrd_join(workers[i], &res);
 
@@ -576,9 +626,9 @@ int main(int argc, const char* argv[])
     u64 end = get_nanoseconds();
 
     u32 elapsed_ms = (end - begin) / (1000ull * 1000ull);
-    printf("Took %u ms, traced %lu rays, %f us per ray\n",
+    printf("\nTook %u ms, traced %.3g rays, %f us per ray\n",
            elapsed_ms,
-           world.traced_ray_count,
+           (float)world.traced_ray_count,
            1000.0f * (float)elapsed_ms / world.traced_ray_count);
 
     int res = stbi_write_png("output.png", img.width, img.height, img.bytes_per_pixel, img.pixels, img.stride);
