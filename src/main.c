@@ -355,9 +355,14 @@ v3 trace_ray(const World* world, w_u32* rng, w_v3 orig, w_v3 dir, u32 max_depth,
         w_float polish = w_float_write(polishes);
 
         emission = w_v3_masked(ray_alive_mask, emission);
-
         result = w_v3_add(result, w_v3_hadamard(attenuation, emission));
+
         ray_alive_mask = w_u32_and(ray_alive_mask, bounced_mask);
+
+        // bail out if the whole lane is dead
+        if (!w_u32_horizontal_or(ray_alive_mask)) {
+            break;
+        }
 
         w_u32 bounce_increment = w_u32_and(ray_alive_mask, w_u32_broadcast(1));
         w_bounces = w_u32_add(w_bounces, bounce_increment);
@@ -371,17 +376,9 @@ v3 trace_ray(const World* world, w_u32* rng, w_v3 orig, w_v3 dir, u32 max_depth,
         w_v3 rnd = w_v3_in_basis(random_cosine_weighted(rng), itx.tangent1, itx.tangent2, itx.normal);
         dir = w_v3_lerp(polish, rnd, mirror);
         dir = w_v3_normalized(dir);
-
-        // bail out if the whole lane is dead
-        if (!w_u32_horizontal_and(ray_alive_mask)) {
-            break;
-        }
     }
 
     *bounces = w_u32_horizontal_add(w_bounces);
-    u32 wasted_bounces = SIMD_LANES * depth - *bounces;
-
-    /* printf("Wasted %u bounces\n", wasted_bounces); */
 
     return w_v3_horizontal_add(result);
 }
@@ -564,7 +561,6 @@ void test_rng()
 }
 
 #define MAX_WORKER_COUNT 256
-#define MIRROR_SPHERES 9
 
 int main(int argc, const char* argv[])
 {
@@ -575,7 +571,7 @@ int main(int argc, const char* argv[])
         .img_width = 2048 / simplify,
         .img_height = 2048 / simplify,
         .worker_count = 12,
-        .max_bounce_count = 8,
+        .max_bounce_count = 10,
         .samples_per_pixel = 64,
     };
 
@@ -589,7 +585,7 @@ int main(int argc, const char* argv[])
     };
 
     Material materials[] = {
-        [0] = {.diffuse = {}, .emission = v3_scale(.0f, (v3){1.f, 1.0f, 1.0f})},  // sky
+        [0] = {.diffuse = {}, .emission = v3_scale(.1f, (v3){1.f, 1.0f, 1.0f})},  // sky
         [1] = {.diffuse = (v3){.3f, .3f, .3f}},                                   // gray
         [2] = {.diffuse = {}, .emission = v3_scale(2.0f, (v3){1.0f, 1.0f, .7f})}, // light
         [3] = {.diffuse = (v3){.9f, .9f, .9f}},                                   // white
@@ -600,31 +596,18 @@ int main(int argc, const char* argv[])
         [8] = {.diffuse = {}, .emission = v3_scale(200.0f, (v3){.7f, .2f, .6f})}, // light 2
     };
 
-    Sphere spheres[7 + MIRROR_SPHERES] = {
-        /* {.center = (v3){0.0f, 0.0f, 12.0f}, .radius = 4.f, .material_index = 2}, // light */
+    Sphere spheres[] = {
+        {.center = (v3){0.0f, 0.0f, 12.0f}, .radius = 4.f, .material_index = 2}, // light
         plane((v3){.0f, .0f, .0f}, (v3){.0f, .0f, 1.0f}, 3),                     // floor
         plane((v3){0.0f, 0.0f, 10.0f}, (v3){0.0f, 0.0f, -1.0f}, 3),              // ceiling
         plane((v3){-5.0f, 0.0f, .0f}, (v3){1.0f, 0.0f, .0f}, 4),                 // left wall
         plane((v3){5.0f, 0.0f, .0f}, (v3){-1.0f, 0.0f, .0f}, 5),                 // right wall
         plane((v3){.0f, 10.0f, .0f}, v3_normalized((v3){-.0f, -1.0f, -.0f}), 1), // back wall
         plane((v3){.0f, -10.0f, .0f}, (v3){.0f, 1.0f, .0f}, 1),                  // front wall
-        // main spheres
-        /* {.center = (v3){-2.0f, -1.0f, 1.5f}, .radius = 1.5f, .material_index = 7}, */
-        /* {.center = (v3){2.0f, .0f, 2.5f}, .radius = 2.5f, .material_index = 6}, */
+        /* main spheres */
+        {.center = (v3){-2.0f, -1.0f, 1.5f}, .radius = 1.5f, .material_index = 7},
+        {.center = (v3){2.0f, .0f, 2.5f}, .radius = 2.5f, .material_index = 6},
     };
-
-    u32 rng = 1328039990; //rand();
-    printf("Seed = %u\n", rng);
-    float amp = 3.5f;
-    for (u32 i = 7; i < 7 + MIRROR_SPHERES; i++) {
-        spheres[i].center =
-            (v3){random_float_bidir(&rng, amp), random_float_bidir(&rng, amp), random_float_bidir(&rng, amp)};
-        spheres[i].center = v3_add(spheres[i].center, (v3){0.0f, 0.0f, 4.0f});
-        spheres[i].radius = .5f + random_float(&rng, .4f);
-        spheres[i].material_index = 7;
-    }
-
-    spheres[15].material_index = 8;
 
     world.materials = materials;
     world.spheres = spheres;
