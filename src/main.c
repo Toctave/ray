@@ -36,6 +36,11 @@ typedef struct {
     Material* materials;
 
     u64 traced_ray_count;
+
+    v3 cam_orig;
+    v3 cam_up;
+    v3 cam_target;
+    float cam_fov;
 } World;
 
 typedef struct {
@@ -53,7 +58,6 @@ typedef struct {
     w_v3 tangent1; // in the plane of the outgoing ray
     w_v3 tangent2; // (t1, t2, normal) is right-handed
     w_v3 normal;
-    w_float t;
     w_u32 material_index;
 } Intersect;
 
@@ -165,6 +169,7 @@ v3 v3_hadamard(v3 u, v3 v)
 w_u32 find_intersect(const World* world, w_v3 orig, w_v3 dir, Intersect* intersect)
 {
     w_u32 res = w_u32_broadcast(0);
+    w_float tmin = w_float_broadcast(INFINITY);
     for (u32 i = 0; i < world->sphere_count; i++) {
         const Sphere* sphere = &world->spheres[i];
 
@@ -181,22 +186,28 @@ w_u32 find_intersect(const World* world, w_v3 orig, w_v3 dir, Intersect* interse
         w_float c = w_float_sub(w_v3_dot(co, co), radius_squared);
 
         w_float disc = w_float_sub(w_float_mul(b, b), w_float_mul(w_float_broadcast(4.0f), c));
+        w_u32 disc_pos_mask = w_float_ge(disc, w_float_broadcast(0.0f));
 
-        w_float sqrt_disc = w_float_sqrt(disc);
-        w_float t = w_float_mul(w_float_broadcast(-.5f), w_float_add(b, sqrt_disc));
+        if (w_u32_horizontal_or(disc_pos_mask)) {
+            w_float sqrt_disc = w_float_sqrt(disc);
+            w_float t = w_float_mul(w_float_broadcast(-.5f), w_float_add(b, sqrt_disc));
 
-        w_u32 assign_mask = w_u32_and(w_float_ge(disc, w_float_broadcast(0.0f)),
-                                      w_u32_and(w_float_gt(t, w_float_broadcast(0.0f)), w_float_lt(t, intersect->t)));
+            w_u32 tvalid = w_u32_and(w_float_gt(t, w_float_broadcast(0.0f)), w_float_lt(t, tmin));
 
-        w_v3 hit_point = w_v3_add(orig, w_v3_scale(t, dir));
-        w_v3 normal = w_v3_normalized(w_v3_sub(hit_point, center));
+            if (w_u32_horizontal_or(tvalid)) {
+                w_u32 assign_mask = w_u32_and(tvalid, disc_pos_mask);
 
-        w_float_conditional_assign(assign_mask, &intersect->t, t);
-        w_v3_conditional_assign(assign_mask, &intersect->normal, normal);
-        w_v3_conditional_assign(assign_mask, &intersect->point, hit_point);
-        w_u32_conditional_assign(assign_mask, &intersect->material_index, mat_index);
+                w_v3 hit_point = w_v3_add(orig, w_v3_scale(t, dir));
+                w_v3 normal = w_v3_div(w_v3_sub(hit_point, center), w_float_broadcast(sphere->radius));
 
-        res = w_u32_or(res, assign_mask);
+                w_float_conditional_assign(assign_mask, &tmin, t);
+                w_v3_conditional_assign(assign_mask, &intersect->normal, normal);
+                w_v3_conditional_assign(assign_mask, &intersect->point, hit_point);
+                w_u32_conditional_assign(assign_mask, &intersect->material_index, mat_index);
+
+                res = w_u32_or(res, assign_mask);
+            }
+        }
     }
 
     intersect->tangent2 =
@@ -222,7 +233,29 @@ w_u32 w_u32_xorshift(w_u32* state)
     return *state;
 }
 
-w_float random_float_bidir(w_u32* state, float amplitude)
+u32 u32_xorshift(u32* state)
+{
+    u32 x = *state;
+    x ^= x << 13;
+    x ^= x >> 13;
+    x ^= x << 5;
+
+    *state = x;
+
+    return *state;
+}
+
+float random_float(u32* state, float amplitude)
+{
+    return (amplitude * u32_xorshift(state) * 0x1.0p-32);
+}
+
+float random_float_bidir(u32* state, float amplitude)
+{
+    return (amplitude * u32_xorshift(state) * 0x1.0p-31 - amplitude);
+}
+
+w_float w_random_float_bidir(w_u32* state, float amplitude)
 {
     w_float s = w_float_broadcast(amplitude * 0x1.0p-31);
 
@@ -233,9 +266,9 @@ w_float random_float_bidir(w_u32* state, float amplitude)
     return x;
 }
 
-w_float random_float(w_u32* state, float amplitude)
+w_float w_random_float(w_u32* state, float amplitude)
 {
-    w_float x = random_float_bidir(state, .5f * amplitude);
+    w_float x = w_random_float_bidir(state, .5f * amplitude);
     x = w_float_add(x, w_float_broadcast(.5f * amplitude));
 
     return x;
@@ -246,15 +279,15 @@ void random_uniform_circle(w_u32* rng, w_float* x_out, w_float* y_out)
 #if 0
     w_float x, y;
     do {
-        x = 2.0f * random_float(rng) - 1.0f;
-        y = 2.0f * random_float(rng) - 1.0f;
+        x = 2.0f * w_random_float(rng) - 1.0f;
+        y = 2.0f * w_random_float(rng) - 1.0f;
     } while (x * x + y * y >= 1.0f);
 
     *x_out = x;
     *y_out = y;
 #else
-    w_float r = w_float_sqrt(random_float(rng, 1.0f));
-    w_float theta = random_float(rng, 2.0f * M_PI);
+    w_float r = w_float_sqrt(w_random_float(rng, 1.0f));
+    w_float theta = w_random_float(rng, 2.0f * M_PI);
 
     *x_out = w_float_mul(r, w_float_cos(theta));
     *y_out = w_float_mul(r, w_float_sin(theta));
@@ -294,9 +327,9 @@ v3 trace_ray(const World* world, w_u32* rng, w_v3 orig, w_v3 dir, u32 max_depth,
 
     w_u32 ray_alive_mask = w_u32_broadcast(0xFFFFFFFF);
 
-    for (u32 depth = 0; depth < max_depth; depth++) {
+    u32 depth;
+    for (depth = 0; depth < max_depth; depth++) {
         Intersect itx = {};
-        itx.t = w_float_broadcast(INFINITY);
 
         w_u32 bounced_mask = find_intersect(world, orig, dir, &itx);
 
@@ -326,7 +359,8 @@ v3 trace_ray(const World* world, w_u32* rng, w_v3 orig, w_v3 dir, u32 max_depth,
         result = w_v3_add(result, w_v3_hadamard(attenuation, emission));
         ray_alive_mask = w_u32_and(ray_alive_mask, bounced_mask);
 
-        w_bounces = w_u32_add(w_bounces, w_u32_and(ray_alive_mask, w_u32_broadcast(1)));
+        w_u32 bounce_increment = w_u32_and(ray_alive_mask, w_u32_broadcast(1));
+        w_bounces = w_u32_add(w_bounces, bounce_increment);
 
         // no cosine term : embedded in cosine-weighted sampling
         attenuation = w_v3_hadamard(attenuation, diffuse);
@@ -338,9 +372,6 @@ v3 trace_ray(const World* world, w_u32* rng, w_v3 orig, w_v3 dir, u32 max_depth,
         dir = w_v3_lerp(polish, rnd, mirror);
         dir = w_v3_normalized(dir);
 
-        // bounceT = -dirT
-        // bounceN = dirN
-
         // bail out if the whole lane is dead
         if (!w_u32_horizontal_and(ray_alive_mask)) {
             break;
@@ -348,6 +379,9 @@ v3 trace_ray(const World* world, w_u32* rng, w_v3 orig, w_v3 dir, u32 max_depth,
     }
 
     *bounces = w_u32_horizontal_add(w_bounces);
+    u32 wasted_bounces = SIMD_LANES * depth - *bounces;
+
+    /* printf("Wasted %u bounces\n", wasted_bounces); */
 
     return w_v3_horizontal_add(result);
 }
@@ -384,15 +418,15 @@ int worker_func(void* ptr)
 {
     WorkQueue* queue = ptr;
 
-    v3 cam_orig = {0.0f, -13.0f, 5.0f};
-    v3 cam_target = {0.0f, 0.0f, 5.0f};
+    v3 cam_orig = queue->world->cam_orig;
+    v3 cam_target = queue->world->cam_target;
+    w_v3 cam_up = w_v3_broadcast(queue->world->cam_up);
 
-    w_v3 cam_up = w_v3_broadcast((v3){.0f, .0f, 1.0f});
     w_v3 cam_dir = w_v3_broadcast(v3_normalized(v3_sub(cam_target, cam_orig)));
     w_v3 cam_x = w_v3_normalized(w_v3_cross(cam_dir, cam_up));
     w_v3 cam_y = w_v3_cross(cam_x, cam_dir);
-    float cam_fov_deg = 60.0f;
-    float cam_fov_rad = M_PI * cam_fov_deg / 180.0f;
+
+    float cam_fov_rad = M_PI * queue->world->cam_fov / 180.0f;
     float cam_depth = 1.0f / tan(cam_fov_rad * .5f);
     float cam_ratio = (float)queue->image.width / queue->image.height;
 
@@ -416,8 +450,8 @@ int worker_func(void* ptr)
                     float sx = 2.0f * cam_ratio / queue->image.width;
                     float sy = -2.0f / queue->image.height;
 
-                    w_float dx = random_float(&rng, sx);
-                    w_float dy = random_float(&rng, sy);
+                    w_float dx = w_random_float(&rng, sx);
+                    w_float dy = w_random_float(&rng, sy);
 
                     w_float sample_x = w_float_add(w_float_broadcast(sx * x - cam_ratio), dx);
                     w_float sample_y = w_float_add(w_float_broadcast(sy * y + 1.0f), dy);
@@ -504,7 +538,7 @@ void test_rng()
 
     u32 samples = 10000000;
     for (u32 i = 0; i < samples / SIMD_LANES; i++) {
-        w_float x = random_float(&rng, 1.0f);
+        w_float x = w_random_float(&rng, 1.0f);
         float xv[4];
         w_float_read(x, xv);
 
@@ -530,22 +564,29 @@ void test_rng()
 }
 
 #define MAX_WORKER_COUNT 256
+#define MIRROR_SPHERES 9
 
 int main(int argc, const char* argv[])
 {
     srand(time(0));
 
+    u32 simplify = 4;
     Config config = {
-        .img_width = 1024,
-        .img_height = 1024,
+        .img_width = 2048 / simplify,
+        .img_height = 2048 / simplify,
         .worker_count = 12,
-        .max_bounce_count = 10,
-        .samples_per_pixel = 32,
+        .max_bounce_count = 8,
+        .samples_per_pixel = 64,
     };
 
     Image img = alloc_image(config.img_width, config.img_height);
 
-    World world = {};
+    World world = {
+        .cam_orig = (v3){.0f, -16.0f, 4.0f},
+        .cam_fov = 45.0f,
+        .cam_target = (v3){.0f, 0.0f, 5.0f},
+        .cam_up = (v3){.0f, .0f, 1.0f},
+    };
 
     Material materials[] = {
         [0] = {.diffuse = {}, .emission = v3_scale(.0f, (v3){1.f, 1.0f, 1.0f})},  // sky
@@ -556,21 +597,34 @@ int main(int argc, const char* argv[])
         [5] = {.diffuse = (v3){.2f, .9f, .9f}},                                   // blue
         [6] = {.diffuse = (v3){.9f, .6f, .1f}},                                   // yellow
         [7] = {.diffuse = (v3){.9f, .9f, .9f}, .polish = .99f},                   // mirror
+        [8] = {.diffuse = {}, .emission = v3_scale(200.0f, (v3){.7f, .2f, .6f})}, // light 2
     };
 
-    Sphere spheres[] = {
+    Sphere spheres[7 + MIRROR_SPHERES] = {
+        /* {.center = (v3){0.0f, 0.0f, 12.0f}, .radius = 4.f, .material_index = 2}, // light */
+        plane((v3){.0f, .0f, .0f}, (v3){.0f, .0f, 1.0f}, 3),                     // floor
+        plane((v3){0.0f, 0.0f, 10.0f}, (v3){0.0f, 0.0f, -1.0f}, 3),              // ceiling
+        plane((v3){-5.0f, 0.0f, .0f}, (v3){1.0f, 0.0f, .0f}, 4),                 // left wall
+        plane((v3){5.0f, 0.0f, .0f}, (v3){-1.0f, 0.0f, .0f}, 5),                 // right wall
+        plane((v3){.0f, 10.0f, .0f}, v3_normalized((v3){-.0f, -1.0f, -.0f}), 1), // back wall
+        plane((v3){.0f, -10.0f, .0f}, (v3){.0f, 1.0f, .0f}, 1),                  // front wall
         // main spheres
-        {.center = (v3){-2.0f, -1.0f, 1.5f}, .radius = 1.5f, .material_index = 7},
-        {.center = (v3){2.0f, .0f, 2.5f}, .radius = 2.5f, .material_index = 6},
-        // light
-        {.center = (v3){0.0f, 0.0f, 12.0f}, .radius = 4.f, .material_index = 2},
-        plane((v3){.0f, .0f, .0f}, (v3){.0f, .0f, 1.0f}, 3),        // floor
-        plane((v3){0.0f, 0.0f, 10.0f}, (v3){0.0f, 0.0f, -1.0f}, 3), // ceiling
-        plane((v3){-5.0f, 0.0f, .0f}, (v3){1.0f, 0.0f, .0f}, 4),    // left wall
-        plane((v3){5.0f, 0.0f, .0f}, (v3){-1.0f, 0.0f, .0f}, 5),    // right wall
-        plane((v3){.0f, 5.0f, .0f}, (v3){.0f, -1.0f, .0f}, 7),      // back wall
-        plane((v3){.0f, -5.0f, .0f}, (v3){.0f, 1.0f, .0f}, 7),      // front wall
+        /* {.center = (v3){-2.0f, -1.0f, 1.5f}, .radius = 1.5f, .material_index = 7}, */
+        /* {.center = (v3){2.0f, .0f, 2.5f}, .radius = 2.5f, .material_index = 6}, */
     };
+
+    u32 rng = 1328039990; //rand();
+    printf("Seed = %u\n", rng);
+    float amp = 3.5f;
+    for (u32 i = 7; i < 7 + MIRROR_SPHERES; i++) {
+        spheres[i].center =
+            (v3){random_float_bidir(&rng, amp), random_float_bidir(&rng, amp), random_float_bidir(&rng, amp)};
+        spheres[i].center = v3_add(spheres[i].center, (v3){0.0f, 0.0f, 4.0f});
+        spheres[i].radius = .5f + random_float(&rng, .4f);
+        spheres[i].material_index = 7;
+    }
+
+    spheres[15].material_index = 8;
 
     world.materials = materials;
     world.spheres = spheres;

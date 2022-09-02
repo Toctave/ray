@@ -164,6 +164,11 @@ static inline b32 w_u32_horizontal_and(w_u32 mask)
     return mask;
 }
 
+static inline b32 w_u32_horizontal_or(w_u32 mask)
+{
+    return mask;
+}
+
 static inline w_u32 w_float_ge(w_float u, w_float v)
 {
     return u >= v ? 0xFFFFFFFF : 0;
@@ -375,6 +380,16 @@ static inline b32 w_u32_horizontal_and(w_u32 mask)
     __m128i and1 = _mm_and_si128(mask.v, vshifted);
     __m128i and1shifted = _mm_srli_si128(and1, 4);
     __m128i and2 = _mm_and_si128(and1, and1shifted);
+
+    return _mm_cvtsi128_si32(and2);
+}
+
+static inline b32 w_u32_horizontal_or(w_u32 mask)
+{
+    __m128i vshifted = _mm_srli_si128(mask.v, 8);
+    __m128i and1 = _mm_or_si128(mask.v, vshifted);
+    __m128i and1shifted = _mm_srli_si128(and1, 4);
+    __m128i and2 = _mm_or_si128(and1, and1shifted);
 
     return _mm_cvtsi128_si32(and2);
 }
