@@ -23,8 +23,6 @@
 #define COMPARE_AND_SWAP(ptr, oldval, newval)                                                                          \
     __atomic_compare_exchange_n(ptr, &oldval, newval, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)
 
-#define TILE_WIDTH 32
-#define TILE_HEIGHT TILE_WIDTH
 
 typedef struct {
     v3 emission;
@@ -93,9 +91,14 @@ typedef struct {
 typedef struct {
     u32 img_width;
     u32 img_height;
-    u32 worker_count;
+
+    u32 tile_width;
+    u32 tile_height;
+
     u32 samples_per_pixel;
     u32 max_bounce_count;
+
+    u32 worker_count;
 } Config;
 
 typedef struct {
@@ -105,17 +108,21 @@ typedef struct {
 } WorkQueue;
 
 typedef struct {
-    // common
     WorkQueue work_queue;
 
     volatile u32 items_retired;
     u32 total_item_count;
 
     Film film;
+    mtx_t film_mtx;
+
     World* world;
     Config config;
+} RenderContext;
 
-    // per worker
+typedef struct {
+    RenderContext* render_context;
+
     FilmPixel* pixel_buffer;
 } WorkerContext;
 
@@ -466,7 +473,10 @@ float linear_to_srgb(float val)
 
 int worker_func(void* ptr)
 {
-    WorkerContext* ctx = ptr;
+    WorkerContext* wctx = ptr;
+    FilmPixel* pixel_buffer = wctx->pixel_buffer;
+
+    RenderContext* ctx = wctx->render_context;
 
     v3 cam_orig = ctx->world->cam_orig;
     v3 cam_target = ctx->world->cam_target;
@@ -493,6 +503,11 @@ int worker_func(void* ptr)
         }
 
         WorkItem item = ctx->work_queue.items[item_index];
+
+        for (u32 i = 0; i < ctx->config.tile_width * ctx->config.tile_height; i++) {
+            pixel_buffer[i].samples = 0;
+            pixel_buffer[i].color = (v3){};
+        }
 
         u32 traced_count = 0;
         for (u32 y = item.y_min; y < item.y_max; y++) {
@@ -526,7 +541,7 @@ int worker_func(void* ptr)
                     col = v3_add(col, dcol);
                 }
 
-                FilmPixel* px = &ctx->film.pixels[y * ctx->film.width + x];
+                FilmPixel* px = &pixel_buffer[(y - item.y_min) * ctx->config.tile_width + (x - item.x_min)];
 
                 px->color = v3_add(px->color, col);
                 px->samples += item.samples;
@@ -535,6 +550,21 @@ int worker_func(void* ptr)
 
         FETCH_ADD(&ctx->world->traced_ray_count, traced_count);
         FETCH_ADD(&ctx->items_retired, 1);
+
+        // copy to film
+        mtx_lock(&ctx->film_mtx);
+
+        for (u32 y = item.y_min; y < item.y_max; y++) {
+            for (u32 x = item.x_min; x < item.x_max; x++) {
+                FilmPixel* src = &pixel_buffer[(y - item.y_min) * ctx->config.tile_width + (x - item.x_min)];
+                FilmPixel* dst = &ctx->film.pixels[y * ctx->film.width + x];
+
+                dst->samples += src->samples;
+                dst->color = v3_add(dst->color, src->color);
+            }
+        }
+
+        mtx_unlock(&ctx->film_mtx);
 
         printf("Did work item %u/%u (%u%%) ...\r",
                ctx->items_retired,
@@ -622,10 +652,12 @@ int main(int argc, const char* argv[])
 {
     srand(time(0));
 
-    u32 simplify = 8;
+    u32 simplify = 4;
     Config config = {
         .img_width = 2048 / simplify,
         .img_height = 2048 / simplify,
+        .tile_width = 32,
+        .tile_height = 32,
         .worker_count = 12,
         .max_bounce_count = 10,
         .samples_per_pixel = 256,
@@ -676,28 +708,30 @@ int main(int argc, const char* argv[])
     world.spheres = spheres;
     world.sphere_count = sizeof(spheres) / sizeof(*spheres);
 
-    u32 x_tile_count = (film.width + TILE_WIDTH - 1) / TILE_WIDTH;
-    u32 y_tile_count = (film.height + TILE_HEIGHT - 1) / TILE_HEIGHT;
+    u32 x_tile_count = (film.width + config.tile_width - 1) / config.tile_width;
+    u32 y_tile_count = (film.height + config.tile_height - 1) / config.tile_height;
 
-    WorkerContext ctx = {};
+    RenderContext ctx = {};
 
     ctx.world = &world;
     ctx.film = film;
+    mtx_init(&ctx.film_mtx, mtx_plain);
+
     ctx.config = config;
 
     ctx.total_item_count = x_tile_count * y_tile_count;
     ctx.work_queue.items = malloc(sizeof(WorkItem) * ctx.total_item_count);
 
     for (u32 tile_y = 0; tile_y < y_tile_count; tile_y++) {
-        u32 y_min = tile_y * TILE_HEIGHT;
-        u32 y_max = y_min + TILE_HEIGHT;
+        u32 y_min = tile_y * config.tile_height;
+        u32 y_max = y_min + config.tile_height;
         if (y_max > film.height) {
             y_max = film.height;
         }
 
         for (u32 tile_x = 0; tile_x < x_tile_count; tile_x++) {
-            u32 x_min = tile_x * TILE_WIDTH;
-            u32 x_max = x_min + TILE_WIDTH;
+            u32 x_min = tile_x * config.tile_width;
+            u32 x_max = x_min + config.tile_width;
             if (x_max > film.width) {
                 x_max = film.width;
             }
@@ -720,10 +754,16 @@ int main(int argc, const char* argv[])
         fprintf(stderr, "Cannot have more than %u worker threads, clamping.\n", MAX_WORKER_COUNT);
     }
 
+    WorkerContext worker_contexts[MAX_WORKER_COUNT] = {};
+    for (u32 i = 0; i < config.worker_count; i++) {
+        worker_contexts[i].render_context = &ctx;
+        worker_contexts[i].pixel_buffer = calloc(config.tile_width * config.tile_height, sizeof(FilmPixel));
+    }
+
     u64 begin = get_nanoseconds();
 
     for (u32 i = 0; i < config.worker_count; i++) {
-        int err = thrd_create(&workers[i], worker_func, &ctx);
+        int err = thrd_create(&workers[i], worker_func, &worker_contexts[i]);
 
         if (err != thrd_success) {
             return 1;
