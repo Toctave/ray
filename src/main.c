@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "base_types.h"
+#include "logging.h"
 #include "my_assert.h"
 #include "simd.h"
 #include "stb_image_write.h"
@@ -19,6 +20,8 @@
 #include "platform.h"
 
 #define FETCH_ADD(ptr, val) __atomic_fetch_add(ptr, val, __ATOMIC_RELAXED)
+#define COMPARE_AND_SWAP(ptr, oldval, newval)                                                                          \
+    __atomic_compare_exchange_n(ptr, &oldval, newval, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)
 
 typedef struct {
     v3 emission;
@@ -94,24 +97,44 @@ typedef struct {
 
 typedef struct {
     WorkItem* items;
-    u32 item_count;
-    u32 next_work_item;
+    volatile u32 front;
+    volatile u32 back;
 } WorkQueue;
 
 typedef struct {
-    u32* items;
-    u32 front;
-    u32 back;
-} TileDoneQueue;
-
-typedef struct {
     WorkQueue work_queue;
-    TileDoneQueue done_queue;
+
+    volatile u32 items_retired;
+    u32 total_item_count;
 
     Film film;
     World* world;
     Config config;
 } WorkerContext;
+
+u32 enqueue_work_item(WorkQueue* queue, WorkItem item)
+{
+    u32 idx = FETCH_ADD(&queue->front, 1);
+    queue->items[idx] = item;
+
+    return idx;
+}
+
+b32 get_next_work_item(WorkQueue* queue, u32* idx)
+{
+    if (queue->back < queue->front) {
+        u32 back = queue->back;
+        u32 newback = back + 1;
+        if (COMPARE_AND_SWAP(&queue->back, back, newback)) {
+            *idx = back;
+            return true;
+        } else {
+            return false;
+        }
+    } else {
+        return false;
+    }
+}
 
 v3 v3_sub(v3 u, v3 v)
 {
@@ -424,7 +447,7 @@ Film alloc_film(u32 width, u32 height)
     result.width = width;
     result.height = height;
 
-    result.pixels = malloc(width * height * sizeof(FilmPixel));
+    result.pixels = calloc(width * height, sizeof(FilmPixel));
 
     return result;
 }
@@ -456,15 +479,19 @@ int worker_func(void* ptr)
     }
     w_u32 rng = w_u32_write(rng_seed);
 
-    while (ctx->work_queue.next_work_item < ctx->work_queue.item_count) {
-        u32 item_index = FETCH_ADD(&ctx->work_queue.next_work_item, 1);
-        WorkItem* item = &ctx->work_queue.items[item_index];
+    while (ctx->items_retired < ctx->total_item_count) {
+        u32 item_index = 0;
+        if (!get_next_work_item(&ctx->work_queue, &item_index)) {
+            continue;
+        }
+
+        WorkItem item = ctx->work_queue.items[item_index];
 
         u32 traced_count = 0;
-        for (u32 y = item->y_min; y < item->y_max; y++) {
-            for (u32 x = item->x_min; x < item->x_max; x++) {
+        for (u32 y = item.y_min; y < item.y_max; y++) {
+            for (u32 x = item.x_min; x < item.x_max; x++) {
                 v3 col = {};
-                for (u32 i = 0; i < item->samples / SIMD_LANES; i++) {
+                for (u32 i = 0; i < item.samples / SIMD_LANES; i++) {
                     float sx = 2.0f * cam_ratio / ctx->film.width;
                     float sy = -2.0f / ctx->film.height;
 
@@ -495,19 +522,17 @@ int worker_func(void* ptr)
                 FilmPixel* px = &ctx->film.pixels[y * ctx->film.width + x];
 
                 px->color = v3_add(px->color, col);
-                px->samples += item->samples;
+                px->samples += item.samples;
             }
         }
 
         FETCH_ADD(&ctx->world->traced_ray_count, traced_count);
+        FETCH_ADD(&ctx->items_retired, 1);
 
-        u32 done_item = FETCH_ADD(&ctx->done_queue.front, 1);
-        ctx->done_queue.items[done_item] = item_index;
-
-        printf("Rendered tile %d/%d (%d%%) ...\r",
-               ctx->done_queue.front,
-               ctx->work_queue.item_count,
-               100 * ctx->done_queue.front / ctx->work_queue.item_count);
+        printf("Did work item %u/%u (%u%%) ...\r",
+               ctx->items_retired,
+               ctx->total_item_count,
+               100 * ctx->items_retired / ctx->total_item_count);
         fflush(stdout);
     }
 
@@ -590,14 +615,18 @@ int main(int argc, const char* argv[])
 {
     srand(time(0));
 
-    u32 simplify = 4;
+    u32 simplify = 8;
     Config config = {
         .img_width = 2048 / simplify,
         .img_height = 2048 / simplify,
-        .worker_count = 24,
+        .worker_count = 12,
         .max_bounce_count = 10,
         .samples_per_pixel = 256,
     };
+
+    u32 samples_per_round = SIMD_LANES;
+    u32 samples_round = ((config.samples_per_pixel + samples_per_round - 1) / samples_per_round);
+    config.samples_per_pixel = samples_round * samples_per_round;
 
     platform_init(argv[0]);
     platform_init_window("ray", config.img_width, config.img_height);
@@ -612,19 +641,19 @@ int main(int argc, const char* argv[])
     };
 
     Material materials[] = {
-        [0] = {.diffuse = {}, .emission = v3_scale(.1f, (v3){1.f, 1.0f, 1.0f})},  // sky
-        [1] = {.diffuse = (v3){.3f, .3f, .3f}},                                   // gray
-        [2] = {.diffuse = {}, .emission = v3_scale(2.0f, (v3){1.0f, 1.0f, .7f})}, // light
-        [3] = {.diffuse = (v3){.9f, .9f, .9f}},                                   // white
-        [4] = {.diffuse = (v3){.9f, .2f, .2f}},                                   // red
-        [5] = {.diffuse = (v3){.2f, .9f, .9f}},                                   // blue
-        [6] = {.diffuse = (v3){.9f, .6f, .1f}},                                   // yellow
-        [7] = {.diffuse = (v3){.9f, .9f, .9f}, .polish = .99f},                   // mirror
-        [8] = {.diffuse = {}, .emission = v3_scale(200.0f, (v3){.7f, .2f, .6f})}, // light 2
+        [0] = {.diffuse = {}, .emission = v3_scale(.1f, (v3){1.f, 1.0f, 1.0f})},   // sky
+        [1] = {.diffuse = (v3){.3f, .3f, .3f}},                                    // gray
+        [2] = {.diffuse = {}, .emission = v3_scale(80.0f, (v3){1.0f, 1.0f, .7f})}, // light
+        [3] = {.diffuse = (v3){.9f, .9f, .9f}},                                    // white
+        [4] = {.diffuse = (v3){.9f, .2f, .2f}},                                    // red
+        [5] = {.diffuse = (v3){.2f, .9f, .9f}},                                    // blue
+        [6] = {.diffuse = (v3){.9f, .6f, .1f}},                                    // yellow
+        [7] = {.diffuse = (v3){.9f, .9f, .9f}, .polish = .99f},                    // mirror
+        [8] = {.diffuse = {}, .emission = v3_scale(200.0f, (v3){.7f, .2f, .6f})},  // light 2
     };
 
     Sphere spheres[] = {
-        {.center = (v3){0.0f, 0.0f, 12.0f}, .radius = 4.f, .material_index = 2}, // light
+        {.center = (v3){0.0f, 0.0f, 10.0f}, .radius = .5f, .material_index = 2}, // light
         plane((v3){.0f, .0f, .0f}, (v3){.0f, .0f, 1.0f}, 3),                     // floor
         plane((v3){0.0f, 0.0f, 10.0f}, (v3){0.0f, 0.0f, -1.0f}, 3),              // ceiling
         plane((v3){-5.0f, 0.0f, .0f}, (v3){1.0f, 0.0f, .0f}, 4),                 // left wall
@@ -652,12 +681,9 @@ int main(int argc, const char* argv[])
     ctx.film = film;
     ctx.config = config;
 
-    ctx.work_queue.item_count = x_tile_count * y_tile_count;
-    ctx.work_queue.items = malloc(sizeof(WorkItem) * ctx.work_queue.item_count);
+    ctx.total_item_count = x_tile_count * y_tile_count;
+    ctx.work_queue.items = malloc(sizeof(WorkItem) * ctx.total_item_count);
 
-    ctx.done_queue.items = malloc(sizeof(WorkItem) * ctx.work_queue.item_count);
-
-    u32 items_queued = 0;
     for (u32 tile_y = 0; tile_y < y_tile_count; tile_y++) {
         u32 y_min = tile_y * tile_height;
         u32 y_max = y_min + tile_height;
@@ -672,17 +698,17 @@ int main(int argc, const char* argv[])
                 x_max = film.width;
             }
 
-            WorkItem* item = &ctx.work_queue.items[items_queued++];
+            WorkItem item = {
+                .x_min = x_min,
+                .x_max = x_max,
+                .y_min = y_min,
+                .y_max = y_max,
+                .samples = config.samples_per_pixel,
+            };
 
-            item->x_min = x_min;
-            item->x_max = x_max;
-            item->y_min = y_min;
-            item->y_max = y_max;
-
-            item->samples = config.samples_per_pixel;
+            enqueue_work_item(&ctx.work_queue, item);
         }
     }
-    ASSERT(items_queued == queue.item_count);
 
     thrd_t workers[MAX_WORKER_COUNT];
     if (config.worker_count > MAX_WORKER_COUNT) {
@@ -702,45 +728,28 @@ int main(int argc, const char* argv[])
 
     PlatformInputInfo input = {};
     Backbuffer bb = platform_get_backbuffer();
-    for (u32 y = 0; y < film.height; y++) {
-        for (u32 x = 0; x < film.width; x++) {
-            BackbufferPixel* bbpx = &bb.pixels[y * bb.stride + x];
-
-            if ((x / 8 + y / 8) % 2) {
-                bbpx->r = bbpx->g = bbpx->b = 0x40;
-            } else {
-                bbpx->r = bbpx->g = bbpx->b = 0x80;
-            }
-            bbpx->a = 0xff;
-        }
-    }
-    platform_swap_buffers();
 
     u64 end = 0;
     while (!input.exit_requested) {
         platform_handle_input_events(&input);
 
-        if (ctx.done_queue.back < ctx.done_queue.front) {
-            u32 q_idx = FETCH_ADD(&ctx.done_queue.back, 1);
-            u32 work_item_idx = ctx.done_queue.items[q_idx];
+        for (u32 y = 0; y < film.height; y++) {
+            for (u32 x = 0; x < film.width; x++) {
+                BackbufferPixel* bbpx = &bb.pixels[y * bb.stride + x];
+                FilmPixel* filmpx = &film.pixels[y * film.width + x];
 
-            WorkItem* item = &ctx.work_queue.items[work_item_idx];
-
-            for (u32 y = item->y_min; y < item->y_max; y++) {
-                for (u32 x = item->x_min; x < item->x_max; x++) {
-                    BackbufferPixel* bbpx = &bb.pixels[y * bb.stride + x];
-                    FilmPixel* filmpx = &film.pixels[y * film.width + x];
-
-                    bbpx->r = 255 * linear_to_srgb(filmpx->color.x / filmpx->samples);
-                    bbpx->g = 255 * linear_to_srgb(filmpx->color.y / filmpx->samples);
-                    bbpx->b = 255 * linear_to_srgb(filmpx->color.z / filmpx->samples);
-                    bbpx->a = 0xff;
-                }
+                bbpx->a = 0xff;
+                bbpx->r = bbpx->a * linear_to_srgb(filmpx->color.x / filmpx->samples);
+                bbpx->g = bbpx->a * linear_to_srgb(filmpx->color.y / filmpx->samples);
+                bbpx->b = bbpx->a * linear_to_srgb(filmpx->color.z / filmpx->samples);
             }
-            platform_swap_buffers();
         }
 
-        if (!end && ctx.done_queue.front == ctx.work_queue.item_count) {
+        platform_swap_buffers();
+
+        ASSERT(ctx.items_retired <= ctx.total_item_count);
+
+        if (!end && ctx.items_retired == ctx.total_item_count) {
             end = get_nanoseconds();
             u32 elapsed_ms = (end - begin) / (1000ull * 1000ull);
             printf("\nTook %u ms, traced %.3g rays, %f us per ray\n",
@@ -758,12 +767,6 @@ int main(int argc, const char* argv[])
             return 1;
         }
     }
-
-    /* int res = stbi_write_png("output.png", img.width, img.height, img.bytes_per_pixel, img.pixels, img.stride); */
-
-    /* if (!res) { */
-    /*     return 1; */
-    /* } */
 
     return 0;
 }
