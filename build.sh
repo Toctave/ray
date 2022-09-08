@@ -1,5 +1,5 @@
 compiler=gcc
-flags="-O3 -g -Wall -Wextra -Wno-missing-braces -Wno-missing-field-initializers -std=gnu11"
+flags="-O3 -g -Wall -Wextra -Wno-missing-braces -Wno-missing-field-initializers -std=gnu11 -msse4.1"
 
 # rm -r build
 mkdir -p build

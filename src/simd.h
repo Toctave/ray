@@ -125,14 +125,10 @@ static inline w_float w_float_sqrt(w_float u)
     return sqrtf(u);
 }
 
-static inline w_float w_float_sin(w_float u)
+static inline void w_float_sincos(w_float u, w_float* s, w_float* c)
 {
-    return sinf(u);
-}
-
-static inline w_float w_float_cos(w_float u)
-{
-    return cosf(u);
+    *s = sinf(u);
+    *c = sinf(u);
 }
 
 static inline w_float w_u32_pun_float(w_u32 u);
@@ -192,6 +188,7 @@ static inline w_u32 w_float_lt(w_float u, w_float v)
 #elif SIMD_LANES == 4
 
 #include <emmintrin.h>
+#include <smmintrin.h>
 
 typedef struct {
     __m128i v;
@@ -329,20 +326,9 @@ static inline w_float w_float_sqrt(w_float u)
     return res;
 }
 
-static inline w_float w_float_sin(w_float u)
+static inline void w_float_sincos(w_float u, w_float* s, w_float* c)
 {
-    w_float res;
-    res.v = sin_ps(u.v);
-
-    return res;
-}
-
-static inline w_float w_float_cos(w_float u)
-{
-    w_float res;
-    res.v = cos_ps(u.v);
-
-    return res;
+    sincos_ps(u.v, &s->v, &c->v);
 }
 
 static inline w_float w_u32_pun_float(w_u32 u);
@@ -387,11 +373,21 @@ static inline b32 w_u32_horizontal_and(w_u32 mask)
 static inline b32 w_u32_horizontal_or(w_u32 mask)
 {
     __m128i vshifted = _mm_srli_si128(mask.v, 8);
-    __m128i and1 = _mm_or_si128(mask.v, vshifted);
-    __m128i and1shifted = _mm_srli_si128(and1, 4);
-    __m128i and2 = _mm_or_si128(and1, and1shifted);
+    __m128i or1 = _mm_or_si128(mask.v, vshifted);
+    __m128i or1shifted = _mm_srli_si128(or1, 4);
+    __m128i or2 = _mm_or_si128(or1, or1shifted);
 
-    return _mm_cvtsi128_si32(and2);
+    return _mm_cvtsi128_si32(or2);
+}
+
+static inline b32 w_u32_mask_any(w_u32 mask)
+{
+    /* __m128i vshifted = _mm_srli_si128(mask.v, 8); */
+    /* __m128i and1 = _mm_or_si128(mask.v, vshifted); */
+    /* __m128i and1shifted = _mm_srli_si128(and1, 4); */
+    /* __m128i and2 = _mm_or_si128(and1, and1shifted); */
+
+    return _mm_movemask_epi8(mask.v);
 }
 
 static inline float w_float_horizontal_add(w_float v)
@@ -448,6 +444,19 @@ static inline w_u32 w_u32_write(const u32 vals[SIMD_LANES])
 static inline void w_u32_read(w_u32 v, u32 out[SIMD_LANES])
 {
     _mm_store_si128((__m128i*)out, v.v);
+}
+
+static inline void w_float_conditional_assign(w_u32 mask, w_float* lhs, w_float rhs)
+{
+    lhs->v = _mm_blendv_ps(lhs->v, rhs.v, w_u32_pun_float(mask).v);
+}
+
+static inline void w_u32_conditional_assign(w_u32 mask, w_u32* lhs, w_u32 rhs)
+{
+    w_float lhs_f = w_u32_pun_float(*lhs);
+    w_float rhs_f = w_u32_pun_float(rhs);
+    w_float_conditional_assign(mask, &lhs_f, rhs_f);
+    *lhs = w_float_pun_u32(lhs_f);
 }
 
 #elif SIMD_LANES == 8
@@ -732,11 +741,6 @@ static inline void w_u32_read(w_u32 v, u32 out[SIMD_LANES])
 #error Only SIMD_LANES==1 or SIMD_LANES==4 supported
 #endif
 
-static inline void w_u32_conditional_assign(w_u32 mask, w_u32* lhs, w_u32 rhs)
-{
-    *lhs = w_u32_or(w_u32_andnot(*lhs, mask), w_u32_and(rhs, mask));
-}
-
 static inline w_float w_u32_pun_float(w_u32 u)
 {
     union _ {
@@ -759,14 +763,6 @@ static inline w_u32 w_float_pun_u32(w_float f)
     union _ pun;
     pun.f = f;
     return pun.u;
-}
-
-static inline void w_float_conditional_assign(w_u32 mask, w_float* lhs, w_float rhs)
-{
-    w_u32 rhs_u = w_float_pun_u32(rhs);
-    w_u32 lhs_u = w_float_pun_u32(*lhs);
-    w_u32_conditional_assign(mask, &lhs_u, rhs_u);
-    *lhs = w_u32_pun_float(lhs_u);
 }
 
 static inline w_float w_float_masked(w_u32 mask, w_float rhs)

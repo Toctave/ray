@@ -16,6 +16,7 @@
 #include "my_assert.h"
 #include "simd.h"
 #include "stb_image_write.h"
+#include "util.h"
 
 #include "platform.h"
 
@@ -40,8 +41,6 @@ typedef struct {
     u32 sphere_count;
     Sphere* spheres;
     Material* materials;
-
-    u64 traced_ray_count;
 
     v3 cam_orig;
     v3 cam_up;
@@ -118,11 +117,16 @@ typedef struct {
 
     World* world;
     Config config;
+
+    volatile b32 stop_requested;
+    volatile u64 traced_ray_count;
+
+    u64 begin_timestamp;
+    u64 end_timestamp;
 } RenderContext;
 
 typedef struct {
     RenderContext* render_context;
-
     FilmPixel* pixel_buffer;
 } WorkerContext;
 
@@ -247,27 +251,34 @@ w_u32 find_intersect(const World* world, w_v3 orig, w_v3 dir, Intersect* interse
         w_float b = w_float_mul(w_float_broadcast(2.0f), w_v3_dot(co, dir));
         w_float c = w_float_sub(w_v3_dot(co, co), radius_squared);
 
-        w_float disc = w_float_sub(w_float_mul(b, b), w_float_mul(w_float_broadcast(4.0f), c));
-        w_u32 disc_pos_mask = w_float_ge(disc, w_float_broadcast(0.0f));
+        w_float b_sq = w_float_mul(b, b);
+        w_float c4 = w_float_mul(w_float_broadcast(4.0f), c);
 
-        if (w_u32_horizontal_or(disc_pos_mask)) {
-            w_float sqrt_disc = w_float_sqrt(disc);
-            w_float t = w_float_mul(w_float_broadcast(-.5f), w_float_add(b, sqrt_disc));
+        w_u32 disc_pos_mask = w_float_ge(b_sq, c4);
 
-            w_u32 tvalid = w_u32_and(w_float_gt(t, w_float_broadcast(0.0f)), w_float_lt(t, tmin));
+        if (w_u32_mask_any(disc_pos_mask)) {
+            w_u32 tpos = w_u32_and(w_float_lt(b, w_float_broadcast(0.0f)), w_float_gt(c, w_float_broadcast(0.0f)));
 
-            if (w_u32_horizontal_or(tvalid)) {
+            if (w_u32_mask_any(tpos)) {
+                w_float disc = w_float_sub(b_sq, c4);
+                w_float sqrt_disc = w_float_sqrt(disc);
+                w_float t = w_float_mul(w_float_broadcast(-.5f), w_float_add(b, sqrt_disc));
+
+                w_u32 tvalid = w_u32_and(tpos, w_float_lt(t, tmin));
+
                 w_u32 assign_mask = w_u32_and(tvalid, disc_pos_mask);
 
-                w_v3 hit_point = w_v3_add(orig, w_v3_scale(t, dir));
-                w_v3 normal = w_v3_div(w_v3_sub(hit_point, center), w_float_broadcast(sphere->radius));
+                if (w_u32_mask_any(assign_mask)) {
+                    w_v3 hit_point = w_v3_add(orig, w_v3_scale(t, dir));
+                    w_v3 normal = w_v3_div(w_v3_sub(hit_point, center), w_float_broadcast(sphere->radius));
 
-                w_float_conditional_assign(assign_mask, &tmin, t);
-                w_v3_conditional_assign(assign_mask, &intersect->normal, normal);
-                w_v3_conditional_assign(assign_mask, &intersect->point, hit_point);
-                w_u32_conditional_assign(assign_mask, &intersect->material_index, mat_index);
+                    w_float_conditional_assign(assign_mask, &tmin, t);
+                    w_v3_conditional_assign(assign_mask, &intersect->normal, normal);
+                    w_v3_conditional_assign(assign_mask, &intersect->point, hit_point);
+                    w_u32_conditional_assign(assign_mask, &intersect->material_index, mat_index);
 
-                res = w_u32_or(res, assign_mask);
+                    res = w_u32_or(res, assign_mask);
+                }
             }
         }
     }
@@ -351,8 +362,11 @@ void random_uniform_circle(w_u32* rng, w_float* x_out, w_float* y_out)
     w_float r = w_float_sqrt(w_random_float(rng, 1.0f));
     w_float theta = w_random_float(rng, 2.0f * M_PI);
 
-    *x_out = w_float_mul(r, w_float_cos(theta));
-    *y_out = w_float_mul(r, w_float_sin(theta));
+    w_float c, s;
+    w_float_sincos(theta, &s, &c);
+
+    *x_out = w_float_mul(r, c);
+    *y_out = w_float_mul(r, s);
 #endif
 }
 
@@ -422,7 +436,7 @@ v3 trace_ray(const World* world, w_u32* rng, w_v3 orig, w_v3 dir, u32 max_depth,
         ray_alive_mask = w_u32_and(ray_alive_mask, bounced_mask);
 
         // bail out if the whole lane is dead
-        if (!w_u32_horizontal_or(ray_alive_mask)) {
+        if (!w_u32_mask_any(ray_alive_mask)) {
             break;
         }
 
@@ -478,11 +492,11 @@ int worker_func(void* ptr)
 
     RenderContext* ctx = wctx->render_context;
 
-    v3 cam_orig = ctx->world->cam_orig;
-    v3 cam_target = ctx->world->cam_target;
+    /* v3 cam_orig = ctx->world->cam_orig; */
+    /* v3 cam_target = ctx->world->cam_target; */
     w_v3 cam_up = w_v3_broadcast(ctx->world->cam_up);
 
-    w_v3 cam_dir = w_v3_broadcast(v3_normalized(v3_sub(cam_target, cam_orig)));
+    w_v3 cam_dir = w_v3_broadcast(v3_normalized(v3_sub(ctx->world->cam_target, ctx->world->cam_orig)));
     w_v3 cam_x = w_v3_normalized(w_v3_cross(cam_dir, cam_up));
     w_v3 cam_y = w_v3_cross(cam_x, cam_dir);
 
@@ -496,7 +510,7 @@ int worker_func(void* ptr)
     }
     w_u32 rng = w_u32_write(rng_seed);
 
-    while (ctx->items_retired < ctx->total_item_count) {
+    while (!ctx->stop_requested) {
         u32 item_index = 0;
         if (!get_next_work_item(&ctx->work_queue, &item_index)) {
             continue;
@@ -504,6 +518,7 @@ int worker_func(void* ptr)
 
         WorkItem item = ctx->work_queue.items[item_index];
 
+        // clear pixel buffer
         for (u32 i = 0; i < ctx->config.tile_width * ctx->config.tile_height; i++) {
             pixel_buffer[i].samples = 0;
             pixel_buffer[i].color = (v3){};
@@ -512,7 +527,8 @@ int worker_func(void* ptr)
         u32 traced_count = 0;
         for (u32 y = item.y_min; y < item.y_max; y++) {
             for (u32 x = item.x_min; x < item.x_max; x++) {
-                v3 col = {};
+                FilmPixel* px = &pixel_buffer[(y - item.y_min) * ctx->config.tile_width + (x - item.x_min)];
+
                 for (u32 i = 0; i < item.samples / SIMD_LANES; i++) {
                     float sx = 2.0f * cam_ratio / ctx->film.width;
                     float sy = -2.0f / ctx->film.height;
@@ -523,7 +539,7 @@ int worker_func(void* ptr)
                     w_float sample_x = w_float_add(w_float_broadcast(sx * x - cam_ratio), dx);
                     w_float sample_y = w_float_add(w_float_broadcast(sy * y + 1.0f), dy);
 
-                    w_v3 ray_orig = w_v3_broadcast(cam_orig);
+                    w_v3 ray_orig = w_v3_broadcast(ctx->world->cam_orig);
 
                     w_v3 ray_cam_coords = {
                         sample_x,
@@ -538,17 +554,14 @@ int worker_func(void* ptr)
                         trace_ray(ctx->world, &rng, ray_orig, ray_dir, ctx->config.max_bounce_count, &bounce_count);
                     traced_count += bounce_count;
 
-                    col = v3_add(col, dcol);
+                    px->color = v3_add(px->color, dcol);
                 }
 
-                FilmPixel* px = &pixel_buffer[(y - item.y_min) * ctx->config.tile_width + (x - item.x_min)];
-
-                px->color = v3_add(px->color, col);
                 px->samples += item.samples;
             }
         }
 
-        FETCH_ADD(&ctx->world->traced_ray_count, traced_count);
+        FETCH_ADD(&ctx->traced_ray_count, traced_count);
         FETCH_ADD(&ctx->items_retired, 1);
 
         // copy to film
@@ -648,16 +661,30 @@ void test_rng()
 
 #define MAX_WORKER_COUNT 256
 
+static void reset_render(RenderContext* ctx)
+{
+    // TODO(octave) : Wait for current tasks to finish
+
+    ctx->items_retired = 0;
+    ctx->work_queue.back = 0;
+    ctx->traced_ray_count = 0;
+
+    ctx->begin_timestamp = get_nanoseconds();
+    ctx->end_timestamp = 0;
+
+    memset(ctx->film.pixels, 0, sizeof(FilmPixel) * ctx->film.width * ctx->film.height);
+}
+
 int main(int argc, const char* argv[])
 {
     srand(time(0));
 
-    u32 simplify = 4;
+    u32 simplify = 2;
     Config config = {
         .img_width = 2048 / simplify,
         .img_height = 2048 / simplify,
-        .tile_width = 32,
-        .tile_height = 32,
+        .tile_width = 64,
+        .tile_height = 64,
         .worker_count = 12,
         .max_bounce_count = 10,
         .samples_per_pixel = 256,
@@ -682,7 +709,7 @@ int main(int argc, const char* argv[])
     Material materials[] = {
         [0] = {.diffuse = {}, .emission = v3_scale(.1f, (v3){1.f, 1.0f, 1.0f})},   // sky
         [1] = {.diffuse = (v3){.3f, .3f, .3f}},                                    // gray
-        [2] = {.diffuse = {}, .emission = v3_scale(80.0f, (v3){1.0f, 1.0f, .7f})}, // light
+        [2] = {.diffuse = {}, .emission = v3_scale(20.0f, (v3){1.0f, 1.0f, .7f})}, // light
         [3] = {.diffuse = (v3){.9f, .9f, .9f}},                                    // white
         [4] = {.diffuse = (v3){.9f, .2f, .2f}},                                    // red
         [5] = {.diffuse = (v3){.2f, .9f, .9f}},                                    // blue
@@ -691,14 +718,15 @@ int main(int argc, const char* argv[])
         [8] = {.diffuse = {}, .emission = v3_scale(200.0f, (v3){.7f, .2f, .6f})},  // light 2
     };
 
+
     Sphere spheres[] = {
-        {.center = (v3){0.0f, 0.0f, 10.0f}, .radius = .5f, .material_index = 2}, // light
-        plane((v3){.0f, .0f, .0f}, (v3){.0f, .0f, 1.0f}, 3),                     // floor
-        plane((v3){0.0f, 0.0f, 10.0f}, (v3){0.0f, 0.0f, -1.0f}, 3),              // ceiling
-        plane((v3){-5.0f, 0.0f, .0f}, (v3){1.0f, 0.0f, .0f}, 4),                 // left wall
-        plane((v3){5.0f, 0.0f, .0f}, (v3){-1.0f, 0.0f, .0f}, 5),                 // right wall
-        plane((v3){.0f, 10.0f, .0f}, v3_normalized((v3){-.0f, -1.0f, -.0f}), 1), // back wall
-        plane((v3){.0f, -10.0f, .0f}, (v3){.0f, 1.0f, .0f}, 1),                  // front wall
+        {.center = (v3){0.0f, 0.0f, 10.0f}, .radius = 1.0f, .material_index = 2}, // light
+        plane((v3){.0f, .0f, .0f}, (v3){.0f, .0f, 1.0f}, 3),                      // floor
+        plane((v3){0.0f, 0.0f, 10.0f}, (v3){0.0f, 0.0f, -1.0f}, 3),               // ceiling
+        plane((v3){-5.0f, 0.0f, .0f}, (v3){1.0f, 0.0f, .0f}, 4),                  // left wall
+        plane((v3){5.0f, 0.0f, .0f}, (v3){-1.0f, 0.0f, .0f}, 5),                  // right wall
+        plane((v3){.0f, 10.0f, .0f}, v3_normalized((v3){-.0f, -1.0f, -.0f}), 1),  // back wall
+        plane((v3){.0f, -10.0f, .0f}, (v3){.0f, 1.0f, .0f}, 1),                   // front wall
         /* main spheres */
         {.center = (v3){-2.0f, -1.0f, 1.5f}, .radius = 1.5f, .material_index = 7},
         {.center = (v3){2.0f, .0f, 2.5f}, .radius = 2.5f, .material_index = 6},
@@ -719,32 +747,34 @@ int main(int argc, const char* argv[])
 
     ctx.config = config;
 
-    ctx.total_item_count = x_tile_count * y_tile_count;
+    ctx.total_item_count = x_tile_count * y_tile_count * samples_round;
     ctx.work_queue.items = malloc(sizeof(WorkItem) * ctx.total_item_count);
 
-    for (u32 tile_y = 0; tile_y < y_tile_count; tile_y++) {
-        u32 y_min = tile_y * config.tile_height;
-        u32 y_max = y_min + config.tile_height;
-        if (y_max > film.height) {
-            y_max = film.height;
-        }
-
-        for (u32 tile_x = 0; tile_x < x_tile_count; tile_x++) {
-            u32 x_min = tile_x * config.tile_width;
-            u32 x_max = x_min + config.tile_width;
-            if (x_max > film.width) {
-                x_max = film.width;
+    for (u32 i = 0; i < samples_round; i++) {
+        for (u32 tile_y = 0; tile_y < y_tile_count; tile_y++) {
+            u32 y_min = tile_y * config.tile_height;
+            u32 y_max = y_min + config.tile_height;
+            if (y_max > film.height) {
+                y_max = film.height;
             }
 
-            WorkItem item = {
-                .x_min = x_min,
-                .x_max = x_max,
-                .y_min = y_min,
-                .y_max = y_max,
-                .samples = config.samples_per_pixel,
-            };
+            for (u32 tile_x = 0; tile_x < x_tile_count; tile_x++) {
+                u32 x_min = tile_x * config.tile_width;
+                u32 x_max = x_min + config.tile_width;
+                if (x_max > film.width) {
+                    x_max = film.width;
+                }
 
-            enqueue_work_item(&ctx.work_queue, item);
+                WorkItem item = {
+                    .x_min = x_min,
+                    .x_max = x_max,
+                    .y_min = y_min,
+                    .y_max = y_max,
+                    .samples = samples_per_round,
+                };
+
+                enqueue_work_item(&ctx.work_queue, item);
+            }
         }
     }
 
@@ -760,7 +790,8 @@ int main(int argc, const char* argv[])
         worker_contexts[i].pixel_buffer = calloc(config.tile_width * config.tile_height, sizeof(FilmPixel));
     }
 
-    u64 begin = get_nanoseconds();
+    ctx.begin_timestamp = get_nanoseconds();
+    ctx.end_timestamp = 0;
 
     for (u32 i = 0; i < config.worker_count; i++) {
         int err = thrd_create(&workers[i], worker_func, &worker_contexts[i]);
@@ -773,9 +804,29 @@ int main(int argc, const char* argv[])
     PlatformInputInfo input = {};
     Backbuffer bb = platform_get_backbuffer();
 
-    u64 end = 0;
     while (!input.exit_requested) {
         platform_handle_input_events(&input);
+
+        if (get_bit(input.keys_pressed, KEY_R)) {
+            reset_render(&ctx);
+        }
+
+        if (get_bit(input.keys_pressed, KEY_LEFT_ARROW)) {
+            world.cam_orig = v3_add(world.cam_orig, (v3){-1, 0, 0});
+            reset_render(&ctx);
+        }
+        if (get_bit(input.keys_pressed, KEY_RIGHT_ARROW)) {
+            world.cam_orig = v3_add(world.cam_orig, (v3){1, 0, 0});
+            reset_render(&ctx);
+        }
+        if (get_bit(input.keys_pressed, KEY_UP_ARROW)) {
+            world.cam_orig = v3_add(world.cam_orig, (v3){0, 1, 0});
+            reset_render(&ctx);
+        }
+        if (get_bit(input.keys_pressed, KEY_DOWN_ARROW)) {
+            world.cam_orig = v3_add(world.cam_orig, (v3){0, -1, 0});
+            reset_render(&ctx);
+        }
 
         for (u32 y = 0; y < film.height; y++) {
             for (u32 x = 0; x < film.width; x++) {
@@ -791,17 +842,19 @@ int main(int argc, const char* argv[])
 
         platform_swap_buffers();
 
-        ASSERT(ctx.items_retired <= ctx.total_item_count);
+        /* ASSERT(ctx.items_retired <= ctx.total_item_count); */
 
-        if (!end && ctx.items_retired == ctx.total_item_count) {
-            end = get_nanoseconds();
-            u32 elapsed_ms = (end - begin) / (1000ull * 1000ull);
+        if (!ctx.end_timestamp && ctx.items_retired == ctx.total_item_count) {
+            ctx.end_timestamp = get_nanoseconds();
+            u32 elapsed_ms = (ctx.end_timestamp - ctx.begin_timestamp) / (1000ull * 1000ull);
             printf("\nTook %u ms, traced %.3g rays, %f us per ray\n",
                    elapsed_ms,
-                   (float)world.traced_ray_count,
-                   1000.0f * (float)elapsed_ms / world.traced_ray_count);
+                   (float)ctx.traced_ray_count,
+                   1000.0f * (float)elapsed_ms / ctx.traced_ray_count);
         }
     }
+
+    ctx.stop_requested = true;
 
     for (u32 i = 0; i < config.worker_count; i++) {
         int res;
