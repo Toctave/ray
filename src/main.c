@@ -23,6 +23,9 @@
 #define COMPARE_AND_SWAP(ptr, oldval, newval)                                                                          \
     __atomic_compare_exchange_n(ptr, &oldval, newval, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)
 
+#define TILE_WIDTH 32
+#define TILE_HEIGHT TILE_WIDTH
+
 typedef struct {
     v3 emission;
     v3 diffuse;
@@ -102,6 +105,7 @@ typedef struct {
 } WorkQueue;
 
 typedef struct {
+    // common
     WorkQueue work_queue;
 
     volatile u32 items_retired;
@@ -110,6 +114,9 @@ typedef struct {
     Film film;
     World* world;
     Config config;
+
+    // per worker
+    FilmPixel* pixel_buffer;
 } WorkerContext;
 
 u32 enqueue_work_item(WorkQueue* queue, WorkItem item)
@@ -669,11 +676,8 @@ int main(int argc, const char* argv[])
     world.spheres = spheres;
     world.sphere_count = sizeof(spheres) / sizeof(*spheres);
 
-    u32 tile_width = 32;
-    u32 tile_height = tile_width;
-
-    u32 x_tile_count = (film.width + tile_width - 1) / tile_width;
-    u32 y_tile_count = (film.height + tile_height - 1) / tile_height;
+    u32 x_tile_count = (film.width + TILE_WIDTH - 1) / TILE_WIDTH;
+    u32 y_tile_count = (film.height + TILE_HEIGHT - 1) / TILE_HEIGHT;
 
     WorkerContext ctx = {};
 
@@ -685,15 +689,15 @@ int main(int argc, const char* argv[])
     ctx.work_queue.items = malloc(sizeof(WorkItem) * ctx.total_item_count);
 
     for (u32 tile_y = 0; tile_y < y_tile_count; tile_y++) {
-        u32 y_min = tile_y * tile_height;
-        u32 y_max = y_min + tile_height;
+        u32 y_min = tile_y * TILE_HEIGHT;
+        u32 y_max = y_min + TILE_HEIGHT;
         if (y_max > film.height) {
             y_max = film.height;
         }
 
         for (u32 tile_x = 0; tile_x < x_tile_count; tile_x++) {
-            u32 x_min = tile_x * tile_width;
-            u32 x_max = x_min + tile_width;
+            u32 x_min = tile_x * TILE_WIDTH;
+            u32 x_max = x_min + TILE_WIDTH;
             if (x_max > film.width) {
                 x_max = film.width;
             }
