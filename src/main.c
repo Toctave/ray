@@ -45,6 +45,18 @@ typedef struct {
     float cam_fov;
 } World;
 
+typedef struct FilmPixel {
+    v3 color;
+    u32 samples;
+} FilmPixel;
+
+typedef struct Film {
+    u32 width;
+    u32 height;
+
+    FilmPixel* pixels;
+} Film;
+
 typedef struct {
     u32 width;
     u32 height;
@@ -68,6 +80,8 @@ typedef struct {
     u32 x_max;
     u32 y_min;
     u32 y_max;
+
+    u32 samples;
 } WorkItem;
 
 typedef struct {
@@ -94,7 +108,7 @@ typedef struct {
     WorkQueue work_queue;
     TileDoneQueue done_queue;
 
-    Image image;
+    Film film;
     World* world;
     Config config;
 } WorkerContext;
@@ -404,15 +418,13 @@ Sphere plane(v3 origin, v3 normal, u32 material_index)
     };
 }
 
-Image alloc_image(u32 width, u32 height)
+Film alloc_film(u32 width, u32 height)
 {
-    Image result;
+    Film result;
     result.width = width;
     result.height = height;
-    result.bytes_per_pixel = 4;
 
-    result.stride = width * result.bytes_per_pixel;
-    result.pixels = malloc(width * height * result.bytes_per_pixel);
+    result.pixels = malloc(width * height * sizeof(FilmPixel));
 
     return result;
 }
@@ -436,7 +448,7 @@ int worker_func(void* ptr)
 
     float cam_fov_rad = M_PI * ctx->world->cam_fov / 180.0f;
     float cam_depth = 1.0f / tan(cam_fov_rad * .5f);
-    float cam_ratio = (float)ctx->image.width / ctx->image.height;
+    float cam_ratio = (float)ctx->film.width / ctx->film.height;
 
     u32 rng_seed[SIMD_LANES];
     for (u32 i = 0; i < SIMD_LANES; i++) {
@@ -451,12 +463,10 @@ int worker_func(void* ptr)
         u32 traced_count = 0;
         for (u32 y = item->y_min; y < item->y_max; y++) {
             for (u32 x = item->x_min; x < item->x_max; x++) {
-                u8* px = &ctx->image.pixels[y * ctx->image.stride + x * ctx->image.bytes_per_pixel];
-
                 v3 col = {};
-                for (u32 i = 0; i < ctx->config.samples_per_pixel / SIMD_LANES; i++) {
-                    float sx = 2.0f * cam_ratio / ctx->image.width;
-                    float sy = -2.0f / ctx->image.height;
+                for (u32 i = 0; i < item->samples / SIMD_LANES; i++) {
+                    float sx = 2.0f * cam_ratio / ctx->film.width;
+                    float sy = -2.0f / ctx->film.height;
 
                     w_float dx = w_random_float(&rng, sx);
                     w_float dy = w_random_float(&rng, sy);
@@ -477,14 +487,15 @@ int worker_func(void* ptr)
                     u32 bounce_count;
                     v3 dcol =
                         trace_ray(ctx->world, &rng, ray_orig, ray_dir, ctx->config.max_bounce_count, &bounce_count);
-                    col = v3_add(col, dcol);
                     traced_count += bounce_count;
+
+                    col = v3_add(col, dcol);
                 }
 
-                *px++ = 255 * linear_to_srgb(col.x / ctx->config.samples_per_pixel);
-                *px++ = 255 * linear_to_srgb(col.y / ctx->config.samples_per_pixel);
-                *px++ = 255 * linear_to_srgb(col.z / ctx->config.samples_per_pixel);
-                *px++ = 0xFF;
+                FilmPixel* px = &ctx->film.pixels[y * ctx->film.width + x];
+
+                px->color = v3_add(px->color, col);
+                px->samples += item->samples;
             }
         }
 
@@ -585,13 +596,13 @@ int main(int argc, const char* argv[])
         .img_height = 2048 / simplify,
         .worker_count = 24,
         .max_bounce_count = 10,
-        .samples_per_pixel = 1024,
+        .samples_per_pixel = 256,
     };
 
     platform_init(argv[0]);
     platform_init_window("ray", config.img_width, config.img_height);
 
-    Image img = alloc_image(config.img_width, config.img_height);
+    Film film = alloc_film(config.img_width, config.img_height);
 
     World world = {
         .cam_orig = (v3){.0f, -16.0f, 4.0f},
@@ -632,13 +643,13 @@ int main(int argc, const char* argv[])
     u32 tile_width = 32;
     u32 tile_height = tile_width;
 
-    u32 x_tile_count = (img.width + tile_width - 1) / tile_width;
-    u32 y_tile_count = (img.height + tile_height - 1) / tile_height;
+    u32 x_tile_count = (film.width + tile_width - 1) / tile_width;
+    u32 y_tile_count = (film.height + tile_height - 1) / tile_height;
 
     WorkerContext ctx = {};
 
     ctx.world = &world;
-    ctx.image = img;
+    ctx.film = film;
     ctx.config = config;
 
     ctx.work_queue.item_count = x_tile_count * y_tile_count;
@@ -650,15 +661,15 @@ int main(int argc, const char* argv[])
     for (u32 tile_y = 0; tile_y < y_tile_count; tile_y++) {
         u32 y_min = tile_y * tile_height;
         u32 y_max = y_min + tile_height;
-        if (y_max > img.height) {
-            y_max = img.height;
+        if (y_max > film.height) {
+            y_max = film.height;
         }
 
         for (u32 tile_x = 0; tile_x < x_tile_count; tile_x++) {
             u32 x_min = tile_x * tile_width;
             u32 x_max = x_min + tile_width;
-            if (x_max > img.width) {
-                x_max = img.width;
+            if (x_max > film.width) {
+                x_max = film.width;
             }
 
             WorkItem* item = &ctx.work_queue.items[items_queued++];
@@ -667,6 +678,8 @@ int main(int argc, const char* argv[])
             item->x_max = x_max;
             item->y_min = y_min;
             item->y_max = y_max;
+
+            item->samples = config.samples_per_pixel;
         }
     }
     ASSERT(items_queued == queue.item_count);
@@ -689,8 +702,8 @@ int main(int argc, const char* argv[])
 
     PlatformInputInfo input = {};
     Backbuffer bb = platform_get_backbuffer();
-    for (u32 y = 0; y < img.height; y++) {
-        for (u32 x = 0; x < img.height; x++) {
+    for (u32 y = 0; y < film.height; y++) {
+        for (u32 x = 0; x < film.width; x++) {
             BackbufferPixel* bbpx = &bb.pixels[y * bb.stride + x];
 
             if ((x / 8 + y / 8) % 2) {
@@ -703,6 +716,7 @@ int main(int argc, const char* argv[])
     }
     platform_swap_buffers();
 
+    u64 end = 0;
     while (!input.exit_requested) {
         platform_handle_input_events(&input);
 
@@ -715,15 +729,24 @@ int main(int argc, const char* argv[])
             for (u32 y = item->y_min; y < item->y_max; y++) {
                 for (u32 x = item->x_min; x < item->x_max; x++) {
                     BackbufferPixel* bbpx = &bb.pixels[y * bb.stride + x];
-                    u8* imgpx = &img.pixels[y * img.stride + x * img.bytes_per_pixel];
+                    FilmPixel* filmpx = &film.pixels[y * film.width + x];
 
-                    bbpx->r = imgpx[0];
-                    bbpx->g = imgpx[1];
-                    bbpx->b = imgpx[2];
+                    bbpx->r = 255 * linear_to_srgb(filmpx->color.x / filmpx->samples);
+                    bbpx->g = 255 * linear_to_srgb(filmpx->color.y / filmpx->samples);
+                    bbpx->b = 255 * linear_to_srgb(filmpx->color.z / filmpx->samples);
                     bbpx->a = 0xff;
                 }
             }
             platform_swap_buffers();
+        }
+
+        if (!end && ctx.done_queue.front == ctx.work_queue.item_count) {
+            end = get_nanoseconds();
+            u32 elapsed_ms = (end - begin) / (1000ull * 1000ull);
+            printf("\nTook %u ms, traced %.3g rays, %f us per ray\n",
+                   elapsed_ms,
+                   (float)world.traced_ray_count,
+                   1000.0f * (float)elapsed_ms / world.traced_ray_count);
         }
     }
 
@@ -736,19 +759,11 @@ int main(int argc, const char* argv[])
         }
     }
 
-    u64 end = get_nanoseconds();
+    /* int res = stbi_write_png("output.png", img.width, img.height, img.bytes_per_pixel, img.pixels, img.stride); */
 
-    u32 elapsed_ms = (end - begin) / (1000ull * 1000ull);
-    printf("\nTook %u ms, traced %.3g rays, %f us per ray\n",
-           elapsed_ms,
-           (float)world.traced_ray_count,
-           1000.0f * (float)elapsed_ms / world.traced_ray_count);
-
-    int res = stbi_write_png("output.png", img.width, img.height, img.bytes_per_pixel, img.pixels, img.stride);
-
-    if (!res) {
-        return 1;
-    }
+    /* if (!res) { */
+    /*     return 1; */
+    /* } */
 
     return 0;
 }
