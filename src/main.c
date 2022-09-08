@@ -16,6 +16,8 @@
 #include "simd.h"
 #include "stb_image_write.h"
 
+#include "platform.h"
+
 #define FETCH_ADD(ptr, val) __atomic_fetch_add(ptr, val, __ATOMIC_RELAXED)
 
 typedef struct {
@@ -80,13 +82,22 @@ typedef struct {
     WorkItem* items;
     u32 item_count;
     u32 next_work_item;
+} WorkQueue;
 
-    u32 retired_tiles;
+typedef struct {
+    u32* items;
+    u32 front;
+    u32 back;
+} TileDoneQueue;
+
+typedef struct {
+    WorkQueue work_queue;
+    TileDoneQueue done_queue;
 
     Image image;
     World* world;
     Config config;
-} WorkQueue;
+} WorkerContext;
 
 v3 v3_sub(v3 u, v3 v)
 {
@@ -413,19 +424,19 @@ float linear_to_srgb(float val)
 
 int worker_func(void* ptr)
 {
-    WorkQueue* queue = ptr;
+    WorkerContext* ctx = ptr;
 
-    v3 cam_orig = queue->world->cam_orig;
-    v3 cam_target = queue->world->cam_target;
-    w_v3 cam_up = w_v3_broadcast(queue->world->cam_up);
+    v3 cam_orig = ctx->world->cam_orig;
+    v3 cam_target = ctx->world->cam_target;
+    w_v3 cam_up = w_v3_broadcast(ctx->world->cam_up);
 
     w_v3 cam_dir = w_v3_broadcast(v3_normalized(v3_sub(cam_target, cam_orig)));
     w_v3 cam_x = w_v3_normalized(w_v3_cross(cam_dir, cam_up));
     w_v3 cam_y = w_v3_cross(cam_x, cam_dir);
 
-    float cam_fov_rad = M_PI * queue->world->cam_fov / 180.0f;
+    float cam_fov_rad = M_PI * ctx->world->cam_fov / 180.0f;
     float cam_depth = 1.0f / tan(cam_fov_rad * .5f);
-    float cam_ratio = (float)queue->image.width / queue->image.height;
+    float cam_ratio = (float)ctx->image.width / ctx->image.height;
 
     u32 rng_seed[SIMD_LANES];
     for (u32 i = 0; i < SIMD_LANES; i++) {
@@ -433,19 +444,19 @@ int worker_func(void* ptr)
     }
     w_u32 rng = w_u32_write(rng_seed);
 
-    while (queue->next_work_item < queue->item_count) {
-        u32 item_index = FETCH_ADD(&queue->next_work_item, 1);
-        WorkItem* item = &queue->items[item_index];
+    while (ctx->work_queue.next_work_item < ctx->work_queue.item_count) {
+        u32 item_index = FETCH_ADD(&ctx->work_queue.next_work_item, 1);
+        WorkItem* item = &ctx->work_queue.items[item_index];
 
         u32 traced_count = 0;
         for (u32 y = item->y_min; y < item->y_max; y++) {
             for (u32 x = item->x_min; x < item->x_max; x++) {
-                u8* px = &queue->image.pixels[y * queue->image.stride + x * queue->image.bytes_per_pixel];
+                u8* px = &ctx->image.pixels[y * ctx->image.stride + x * ctx->image.bytes_per_pixel];
 
                 v3 col = {};
-                for (u32 i = 0; i < queue->config.samples_per_pixel / SIMD_LANES; i++) {
-                    float sx = 2.0f * cam_ratio / queue->image.width;
-                    float sy = -2.0f / queue->image.height;
+                for (u32 i = 0; i < ctx->config.samples_per_pixel / SIMD_LANES; i++) {
+                    float sx = 2.0f * cam_ratio / ctx->image.width;
+                    float sy = -2.0f / ctx->image.height;
 
                     w_float dx = w_random_float(&rng, sx);
                     w_float dy = w_random_float(&rng, sy);
@@ -465,25 +476,27 @@ int worker_func(void* ptr)
 
                     u32 bounce_count;
                     v3 dcol =
-                        trace_ray(queue->world, &rng, ray_orig, ray_dir, queue->config.max_bounce_count, &bounce_count);
+                        trace_ray(ctx->world, &rng, ray_orig, ray_dir, ctx->config.max_bounce_count, &bounce_count);
                     col = v3_add(col, dcol);
                     traced_count += bounce_count;
                 }
 
-                *px++ = 255 * linear_to_srgb(col.x / queue->config.samples_per_pixel);
-                *px++ = 255 * linear_to_srgb(col.y / queue->config.samples_per_pixel);
-                *px++ = 255 * linear_to_srgb(col.z / queue->config.samples_per_pixel);
+                *px++ = 255 * linear_to_srgb(col.x / ctx->config.samples_per_pixel);
+                *px++ = 255 * linear_to_srgb(col.y / ctx->config.samples_per_pixel);
+                *px++ = 255 * linear_to_srgb(col.z / ctx->config.samples_per_pixel);
                 *px++ = 0xFF;
             }
         }
 
-        FETCH_ADD(&queue->world->traced_ray_count, traced_count);
-        FETCH_ADD(&queue->retired_tiles, 1);
+        FETCH_ADD(&ctx->world->traced_ray_count, traced_count);
+
+        u32 done_item = FETCH_ADD(&ctx->done_queue.front, 1);
+        ctx->done_queue.items[done_item] = item_index;
 
         printf("Rendered tile %d/%d (%d%%) ...\r",
-               queue->retired_tiles,
-               queue->item_count,
-               100 * queue->retired_tiles / queue->item_count);
+               ctx->done_queue.front,
+               ctx->work_queue.item_count,
+               100 * ctx->done_queue.front / ctx->work_queue.item_count);
         fflush(stdout);
     }
 
@@ -570,10 +583,13 @@ int main(int argc, const char* argv[])
     Config config = {
         .img_width = 2048 / simplify,
         .img_height = 2048 / simplify,
-        .worker_count = 12,
+        .worker_count = 24,
         .max_bounce_count = 10,
-        .samples_per_pixel = 64,
+        .samples_per_pixel = 1024,
     };
+
+    platform_init(argv[0]);
+    platform_init_window("ray", config.img_width, config.img_height);
 
     Image img = alloc_image(config.img_width, config.img_height);
 
@@ -619,12 +635,16 @@ int main(int argc, const char* argv[])
     u32 x_tile_count = (img.width + tile_width - 1) / tile_width;
     u32 y_tile_count = (img.height + tile_height - 1) / tile_height;
 
-    WorkQueue queue = {};
-    queue.world = &world;
-    queue.image = img;
-    queue.config = config;
-    queue.item_count = x_tile_count * y_tile_count;
-    queue.items = malloc(sizeof(WorkItem) * queue.item_count);
+    WorkerContext ctx = {};
+
+    ctx.world = &world;
+    ctx.image = img;
+    ctx.config = config;
+
+    ctx.work_queue.item_count = x_tile_count * y_tile_count;
+    ctx.work_queue.items = malloc(sizeof(WorkItem) * ctx.work_queue.item_count);
+
+    ctx.done_queue.items = malloc(sizeof(WorkItem) * ctx.work_queue.item_count);
 
     u32 items_queued = 0;
     for (u32 tile_y = 0; tile_y < y_tile_count; tile_y++) {
@@ -641,7 +661,7 @@ int main(int argc, const char* argv[])
                 x_max = img.width;
             }
 
-            WorkItem* item = &queue.items[items_queued++];
+            WorkItem* item = &ctx.work_queue.items[items_queued++];
 
             item->x_min = x_min;
             item->x_max = x_max;
@@ -660,10 +680,50 @@ int main(int argc, const char* argv[])
     u64 begin = get_nanoseconds();
 
     for (u32 i = 0; i < config.worker_count; i++) {
-        int err = thrd_create(&workers[i], worker_func, &queue);
+        int err = thrd_create(&workers[i], worker_func, &ctx);
 
         if (err != thrd_success) {
             return 1;
+        }
+    }
+
+    PlatformInputInfo input = {};
+    Backbuffer bb = platform_get_backbuffer();
+    for (u32 y = 0; y < img.height; y++) {
+        for (u32 x = 0; x < img.height; x++) {
+            BackbufferPixel* bbpx = &bb.pixels[y * bb.stride + x];
+
+            if ((x / 8 + y / 8) % 2) {
+                bbpx->r = bbpx->g = bbpx->b = 0x40;
+            } else {
+                bbpx->r = bbpx->g = bbpx->b = 0x80;
+            }
+            bbpx->a = 0xff;
+        }
+    }
+    platform_swap_buffers();
+
+    while (!input.exit_requested) {
+        platform_handle_input_events(&input);
+
+        if (ctx.done_queue.back < ctx.done_queue.front) {
+            u32 q_idx = FETCH_ADD(&ctx.done_queue.back, 1);
+            u32 work_item_idx = ctx.done_queue.items[q_idx];
+
+            WorkItem* item = &ctx.work_queue.items[work_item_idx];
+
+            for (u32 y = item->y_min; y < item->y_max; y++) {
+                for (u32 x = item->x_min; x < item->x_max; x++) {
+                    BackbufferPixel* bbpx = &bb.pixels[y * bb.stride + x];
+                    u8* imgpx = &img.pixels[y * img.stride + x * img.bytes_per_pixel];
+
+                    bbpx->r = imgpx[0];
+                    bbpx->g = imgpx[1];
+                    bbpx->b = imgpx[2];
+                    bbpx->a = 0xff;
+                }
+            }
+            platform_swap_buffers();
         }
     }
 

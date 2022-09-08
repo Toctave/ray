@@ -1,8 +1,8 @@
 #pragma once
 
 #include "base_types.h"
-#include "math.h"
 #include "my_assert.h"
+#include "my_math.h"
 #include "sse_mathfun.h"
 
 #define SIMD_LANES 4
