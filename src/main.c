@@ -6,9 +6,11 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <tgmath.h>
 #include <threads.h>
 #include <time.h>
+
 #include <unistd.h>
 
 #include "base_types.h"
@@ -59,16 +61,6 @@ typedef struct Film {
 
     FilmPixel* pixels;
 } Film;
-
-typedef struct {
-    u32 width;
-    u32 height;
-
-    u32 stride;
-    u8 bytes_per_pixel;
-
-    u8* pixels;
-} Image;
 
 typedef struct {
     w_v3 point;
@@ -287,9 +279,9 @@ w_u32 find_intersect(const World* world, w_v3 orig, w_v3 dir, Intersect* interse
         w_v3_normalized(w_v3_cross(dir, intersect->normal)); // TODO(octave) : fallback for orthogonal hits
     intersect->tangent1 = w_v3_cross(intersect->tangent2, intersect->normal);
 
-    ASSERT_W_V3_NORMALIZED(res, intersect->normal, 1.0e-3f);
-    ASSERT_W_V3_NORMALIZED(res, intersect->tangent2, 1.0e-3f);
-    ASSERT_W_V3_NORMALIZED(res, intersect->tangent1, 1.0e-3f);
+    ASSERT_W_V3_NORMALIZED(res, intersect->normal, 1.0e-2f);
+    ASSERT_W_V3_NORMALIZED(res, intersect->tangent2, 1.0e-2f);
+    ASSERT_W_V3_NORMALIZED(res, intersect->tangent1, 1.0e-2f);
 
     return res;
 }
@@ -303,7 +295,7 @@ w_u32 w_u32_xorshift(w_u32* state)
 
     *state = x;
 
-    return *state;
+    return x;
 }
 
 u32 u32_xorshift(u32* state)
@@ -337,6 +329,18 @@ w_float w_random_float_bidir(w_u32* state, float amplitude)
     x = w_float_mul(x, s);             // divide by 2^31, multiply by amplitude
 
     return x;
+}
+
+w_v3 w_v3_lerp(w_float lambda, w_v3 u, w_v3 v)
+{
+    w_float oml = w_float_sub(w_float_broadcast(1.0f), lambda);
+    return w_v3_add(w_v3_scale(oml, u), w_v3_scale(lambda, v));
+}
+
+w_float w_float_lerp(w_float lambda, w_float u, w_float v)
+{
+    w_float oml = w_float_sub(w_float_broadcast(1.0f), lambda);
+    return w_float_add(w_float_mul(oml, u), w_float_mul(lambda, v));
 }
 
 w_float w_random_float(w_u32* state, float amplitude)
@@ -387,12 +391,6 @@ w_v3 w_v3_mirrored(w_v3 dir, w_v3 normal)
     // r = -n*N + t* T = u - 2 * n * N
     w_v3 res = w_v3_add(dir, w_v3_scale(w_float_mul(w_float_broadcast(-2.0f), n), normal));
     return res;
-}
-
-w_v3 w_v3_lerp(w_float lambda, w_v3 u, w_v3 v)
-{
-    w_float oml = w_float_sub(w_float_broadcast(1.0f), lambda);
-    return w_v3_add(w_v3_scale(oml, u), w_v3_scale(lambda, v));
 }
 
 v3 trace_ray(const World* world, w_u32* rng, w_v3 orig, w_v3 dir, u32 max_depth, u32* bounces)
@@ -561,29 +559,31 @@ int worker_func(void* ptr)
             }
         }
 
-        FETCH_ADD(&ctx->traced_ray_count, traced_count);
-        FETCH_ADD(&ctx->items_retired, 1);
+        if (ctx->work_queue.back > item_index) { // TODO : more robust check that we weren't interrupted
+            FETCH_ADD(&ctx->traced_ray_count, traced_count);
+            FETCH_ADD(&ctx->items_retired, 1);
 
-        // copy to film
-        mtx_lock(&ctx->film_mtx);
+            // copy to film
+            mtx_lock(&ctx->film_mtx);
 
-        for (u32 y = item.y_min; y < item.y_max; y++) {
-            for (u32 x = item.x_min; x < item.x_max; x++) {
-                FilmPixel* src = &pixel_buffer[(y - item.y_min) * ctx->config.tile_width + (x - item.x_min)];
-                FilmPixel* dst = &ctx->film.pixels[y * ctx->film.width + x];
+            for (u32 y = item.y_min; y < item.y_max; y++) {
+                for (u32 x = item.x_min; x < item.x_max; x++) {
+                    FilmPixel* src = &pixel_buffer[(y - item.y_min) * ctx->config.tile_width + (x - item.x_min)];
+                    FilmPixel* dst = &ctx->film.pixels[y * ctx->film.width + x];
 
-                dst->samples += src->samples;
-                dst->color = v3_add(dst->color, src->color);
+                    dst->samples += src->samples;
+                    dst->color = v3_add(dst->color, src->color);
+                }
             }
+
+            mtx_unlock(&ctx->film_mtx);
+
+            printf("Did work item %u/%u (%u%%) ...\r",
+                   ctx->items_retired,
+                   ctx->total_item_count,
+                   100 * ctx->items_retired / ctx->total_item_count);
+            fflush(stdout);
         }
-
-        mtx_unlock(&ctx->film_mtx);
-
-        printf("Did work item %u/%u (%u%%) ...\r",
-               ctx->items_retired,
-               ctx->total_item_count,
-               100 * ctx->items_retired / ctx->total_item_count);
-        fflush(stdout);
     }
 
     return 0;
@@ -672,22 +672,25 @@ static void reset_render(RenderContext* ctx)
     ctx->begin_timestamp = get_nanoseconds();
     ctx->end_timestamp = 0;
 
+    // copy to film
+    mtx_lock(&ctx->film_mtx);
     memset(ctx->film.pixels, 0, sizeof(FilmPixel) * ctx->film.width * ctx->film.height);
+    mtx_unlock(&ctx->film_mtx);
 }
 
-int main(int argc, const char* argv[])
+int main(int /* argc */, const char* argv[])
 {
     srand(time(0));
 
-    u32 simplify = 2;
+    u32 simplify = 4;
     Config config = {
         .img_width = 2048 / simplify,
         .img_height = 2048 / simplify,
         .tile_width = 64,
         .tile_height = 64,
         .worker_count = 12,
-        .max_bounce_count = 10,
-        .samples_per_pixel = 256,
+        .max_bounce_count = 20,
+        .samples_per_pixel = 65536,
     };
 
     u32 samples_per_round = SIMD_LANES;
@@ -811,21 +814,23 @@ int main(int argc, const char* argv[])
             reset_render(&ctx);
         }
 
-        if (get_bit(input.keys_pressed, KEY_LEFT_ARROW)) {
-            world.cam_orig = v3_add(world.cam_orig, (v3){-1, 0, 0});
-            reset_render(&ctx);
-        }
-        if (get_bit(input.keys_pressed, KEY_RIGHT_ARROW)) {
-            world.cam_orig = v3_add(world.cam_orig, (v3){1, 0, 0});
-            reset_render(&ctx);
-        }
-        if (get_bit(input.keys_pressed, KEY_UP_ARROW)) {
-            world.cam_orig = v3_add(world.cam_orig, (v3){0, 1, 0});
-            reset_render(&ctx);
-        }
-        if (get_bit(input.keys_pressed, KEY_DOWN_ARROW)) {
-            world.cam_orig = v3_add(world.cam_orig, (v3){0, -1, 0});
-            reset_render(&ctx);
+        struct {
+            u32 key;
+            v3 direction;
+        } controls[] = {
+            {KEY_W, {0, 1, 0}},
+            {KEY_A, {-1, 0, 0}},
+            {KEY_S, {0, -1, 0}},
+            {KEY_D, {1, 0, 0}},
+            {KEY_UP_ARROW, {0, 0, 1}},
+            {KEY_DOWN_ARROW, {0, 0, -1}},
+        };
+
+        for (u32 i = 0; i < STATIC_ARRAY_COUNT(controls); i++) {
+            if (get_bit(input.keys_pressed, controls[i].key)) {
+                world.cam_orig = v3_add(world.cam_orig, controls[i].direction);
+                reset_render(&ctx);
+            }
         }
 
         for (u32 y = 0; y < film.height; y++) {
@@ -842,17 +847,30 @@ int main(int argc, const char* argv[])
 
         platform_swap_buffers();
 
-        /* ASSERT(ctx.items_retired <= ctx.total_item_count); */
+        ASSERT(ctx.items_retired <= ctx.total_item_count);
 
         if (!ctx.end_timestamp && ctx.items_retired == ctx.total_item_count) {
             ctx.end_timestamp = get_nanoseconds();
-            u32 elapsed_ms = (ctx.end_timestamp - ctx.begin_timestamp) / (1000ull * 1000ull);
-            printf("\nTook %u ms, traced %.3g rays, %f us per ray\n",
+            u64 elapsed_ns = (ctx.end_timestamp - ctx.begin_timestamp);
+            u32 elapsed_ms = elapsed_ns / (1000ull * 1000ull);
+            printf("Took %u ms, traced %.3g rays, %.2f worker.ns per ray (%.1f MRay/(worker.s))\n",
                    elapsed_ms,
                    (float)ctx.traced_ray_count,
-                   1000.0f * (float)elapsed_ms / ctx.traced_ray_count);
+                   (float)config.worker_count * elapsed_ns / ctx.traced_ray_count,
+                   1000.0f * ctx.traced_ray_count / (elapsed_ns * config.worker_count));
         }
+
+        platform_sleep_nanoseconds(10ull * 1000ull * 1000ull);
     }
+
+    ctx.end_timestamp = get_nanoseconds();
+    u64 elapsed_ns = (ctx.end_timestamp - ctx.begin_timestamp);
+    u32 elapsed_ms = elapsed_ns / (1000ull * 1000ull);
+    printf("Took %u ms, traced %.3g rays, %.2f worker.ns per ray (%.1f MRay/(worker.s))\n",
+           elapsed_ms,
+           (float)ctx.traced_ray_count,
+           (float)config.worker_count * elapsed_ns / ctx.traced_ray_count,
+           1000.0f * ctx.traced_ray_count / (elapsed_ns * config.worker_count));
 
     ctx.stop_requested = true;
 
@@ -864,6 +882,38 @@ int main(int argc, const char* argv[])
             return 1;
         }
     }
+
+    u8* pixels = malloc(film.width * film.height * 4);
+
+    for (u32 y = 0; y < film.height; y++) {
+        for (u32 x = 0; x < film.width; x++) {
+            u8* px = &pixels[(y * film.width + x) * 4];
+            FilmPixel* filmpx = &film.pixels[y * film.width + x];
+
+            px[0] = 0xff * linear_to_srgb(filmpx->color.x / filmpx->samples);
+            px[1] = 0xff * linear_to_srgb(filmpx->color.y / filmpx->samples);
+            px[2] = 0xff * linear_to_srgb(filmpx->color.z / filmpx->samples);
+            px[3] = 0xff;
+        }
+    }
+
+    time_t t = time(NULL);
+    struct tm now = *localtime(&t);
+
+    char filename[512];
+    snprintf(filename,
+             sizeof(filename),
+             "output/output-%04d%02d%02d-%02d%02d%02d.png",
+             now.tm_year + 1900,
+             now.tm_mon + 1,
+             now.tm_mday,
+             now.tm_hour,
+             now.tm_min,
+             now.tm_sec);
+    stbi_write_png(filename, film.width, film.height, 4, pixels, film.width * 4);
+
+    int err = execlp("xdg-open", "xdg-open", filename, (char*)0);
+    perror(strerror(err));
 
     return 0;
 }

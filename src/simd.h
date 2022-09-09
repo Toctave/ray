@@ -326,6 +326,14 @@ static inline w_float w_float_sqrt(w_float u)
     return res;
 }
 
+static inline w_float w_float_rsqrt(w_float u)
+{
+    w_float res;
+    res.v = _mm_rsqrt_ps(u.v);
+
+    return res;
+}
+
 static inline void w_float_sincos(w_float u, w_float* s, w_float* c)
 {
     sincos_ps(u.v, &s->v, &c->v);
