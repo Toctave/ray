@@ -635,7 +635,7 @@ void test_rng()
     u32 samples = 10000000;
     for (u32 i = 0; i < samples / SIMD_LANES; i++) {
         w_float x = w_random_float(&rng, 1.0f);
-        float xv[4];
+        float xv[SIMD_LANES];
         w_float_read(x, xv);
 
         for (u32 l = 0; l < SIMD_LANES; l++) {
@@ -835,7 +835,7 @@ int main(int /* argc */, const char* argv[])
 
         for (u32 y = 0; y < film.height; y++) {
             for (u32 x = 0; x < film.width; x++) {
-                BackbufferPixel* bbpx = &bb.pixels[y * bb.stride + x];
+                BackbufferPixel* bbpx = &bb.pixels[y * bb.width + x];
                 FilmPixel* filmpx = &film.pixels[y * film.width + x];
 
                 bbpx->a = 0xff;

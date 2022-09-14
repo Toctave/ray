@@ -1,11 +1,10 @@
 #pragma once
 
+#include "assert.h"
 #include "base_types.h"
-#include "my_assert.h"
 #include "my_math.h"
-#include "sse_mathfun.h"
 
-#define SIMD_LANES 4
+#define SIMD_LANES 8
 
 #define ASSERT_ALIGNED16(ptr) ASSERT((uintptr_t)ptr % 16 == 0)
 #define ASSERT_ALIGNED32(ptr) ASSERT((uintptr_t)ptr % 32 == 0)
@@ -13,9 +12,9 @@
 #define ASSERT_W_FLOAT_EQUAL(mask, u, v, tol)                                                                          \
     do {                                                                                                               \
         w_float s = w_float_sub(u, v);                                                                                 \
-        u32 maskv[SIMD_LANES];                                                                                         \
+        u32 __attribute__((aligned(32))) maskv[SIMD_LANES];                                                            \
         w_u32_read(mask, maskv);                                                                                       \
-        float sv[SIMD_LANES];                                                                                          \
+        float __attribute__((aligned(32))) sv[SIMD_LANES];                                                             \
         w_float_read(s, sv);                                                                                           \
         for (u32 i = 0; i < SIMD_LANES; i++) {                                                                         \
             if (maskv[i]) {                                                                                            \
@@ -155,16 +154,6 @@ static inline float w_float_horizontal_add(w_float v)
     return v;
 }
 
-static inline b32 w_u32_horizontal_and(w_u32 mask)
-{
-    return mask;
-}
-
-static inline b32 w_u32_horizontal_or(w_u32 mask)
-{
-    return mask;
-}
-
 static inline w_u32 w_float_ge(w_float u, w_float v)
 {
     return u >= v ? 0xFFFFFFFF : 0;
@@ -187,6 +176,7 @@ static inline w_u32 w_float_lt(w_float u, w_float v)
 
 #elif SIMD_LANES == 4
 
+#include "sse_mathfun.h"
 #include <emmintrin.h>
 #include <smmintrin.h>
 
@@ -368,33 +358,8 @@ static inline u32 w_u32_horizontal_add(w_u32 v)
     return _mm_cvtsi128_si32(sum2);
 }
 
-static inline b32 w_u32_horizontal_and(w_u32 mask)
-{
-    __m128i vshifted = _mm_srli_si128(mask.v, 8);
-    __m128i and1 = _mm_and_si128(mask.v, vshifted);
-    __m128i and1shifted = _mm_srli_si128(and1, 4);
-    __m128i and2 = _mm_and_si128(and1, and1shifted);
-
-    return _mm_cvtsi128_si32(and2);
-}
-
-static inline b32 w_u32_horizontal_or(w_u32 mask)
-{
-    __m128i vshifted = _mm_srli_si128(mask.v, 8);
-    __m128i or1 = _mm_or_si128(mask.v, vshifted);
-    __m128i or1shifted = _mm_srli_si128(or1, 4);
-    __m128i or2 = _mm_or_si128(or1, or1shifted);
-
-    return _mm_cvtsi128_si32(or2);
-}
-
 static inline b32 w_u32_mask_any(w_u32 mask)
 {
-    /* __m128i vshifted = _mm_srli_si128(mask.v, 8); */
-    /* __m128i and1 = _mm_or_si128(mask.v, vshifted); */
-    /* __m128i and1shifted = _mm_srli_si128(and1, 4); */
-    /* __m128i and2 = _mm_or_si128(and1, and1shifted); */
-
     return _mm_movemask_epi8(mask.v);
 }
 
@@ -469,6 +434,7 @@ static inline void w_u32_conditional_assign(w_u32 mask, w_u32* lhs, w_u32 rhs)
 
 #elif SIMD_LANES == 8
 
+#include "avx_mathfun.h"
 #include <immintrin.h>
 
 typedef struct {
@@ -485,7 +451,7 @@ static inline w_u32 w_float_pun_u32(w_float f);
 static inline w_u32 w_u32_broadcast(u32 base)
 {
     w_u32 res;
-    res.v = _mm256_set_epi32(base, base, base, base, base, base, base, base);
+    *(__m256*)&res.v = _mm256_broadcast_ss((float*)&base);
 
     return res;
 }
@@ -493,7 +459,7 @@ static inline w_u32 w_u32_broadcast(u32 base)
 static inline w_float w_float_broadcast(float val)
 {
     w_float res;
-    res.v = _mm256_set_ps(val, val, val, val, val, val, val, val);
+    res.v = _mm256_broadcast_ss(&val);
 
     return res;
 }
@@ -586,7 +552,7 @@ static inline w_u32 w_u32_add(w_u32 lhs, w_u32 rhs)
     __m128i lhs_lo, lhs_hi;
     __m128i rhs_lo, rhs_hi;
     _mm256_storeu2_m128i(&lhs_hi, &lhs_lo, lhs.v);
-    _mm256_storeu2_m128i(&rhs_hi, &rhs_lo, lhs.v);
+    _mm256_storeu2_m128i(&rhs_hi, &rhs_lo, rhs.v);
 
     __m128i lo = _mm_add_epi32(lhs_lo, rhs_lo);
     __m128i hi = _mm_add_epi32(lhs_hi, rhs_hi);
@@ -637,20 +603,9 @@ static inline w_float w_float_sqrt(w_float u)
     return res;
 }
 
-static inline w_float w_float_sin(w_float u)
+static inline void w_float_sincos(w_float u, w_float* s, w_float* c)
 {
-    w_float res;
-    res.v = sin_ps(u.v);
-
-    return res;
-}
-
-static inline w_float w_float_cos(w_float u)
-{
-    w_float res;
-    res.v = cos_ps(u.v);
-
-    return res;
+    sincos256_ps(u.v, &s->v, &c->v);
 }
 
 static inline w_float w_s32_cast_float(w_u32 u)
@@ -671,39 +626,32 @@ static inline w_u32 w_float_cast_u32(w_float f)
 
 static inline u32 w_u32_horizontal_add(w_u32 v)
 {
-    __m128i vshifted = _mm_srli_si128(v.v, 8);
-    __m128i sum1 = _mm_add_epi32(v.v, vshifted);
-    __m128i sum1shifted = _mm_srli_si128(sum1, 4);
-    __m128i sum2 = _mm_add_epi32(sum1, sum1shifted);
+    __m128i x128 =
+        _mm_add_epi32((__m128i)_mm256_extractf128_ps((__m256)v.v, 1), (__m128i)_mm256_castps256_ps128((__m256)v.v));
 
-    return _mm_cvtsi128_si32(sum2);
-}
+    __m128i x64 = _mm_add_epi32(x128, (__m128i)_mm_movehl_ps((__m128)x128, (__m128)x128));
+    /* ( -, -, -, x0+x1+x2+x3+x4+x5+x6+x7 ) */
+    __m128i x32 = _mm_add_epi32(x64, _mm_shuffle_epi32(x64, 0x55));
 
-static inline b32 w_u32_horizontal_and(w_u32 mask)
-{
-    __m128i vshifted = _mm_srli_si128(mask.v, 8);
-    __m128i and1 = _mm_and_si128(mask.v, vshifted);
-    __m128i and1shifted = _mm_srli_si128(and1, 4);
-    __m128i and2 = _mm_and_si128(and1, and1shifted);
-
-    return _mm_cvtsi128_si32(and2);
+    return _mm_cvtsi128_si32(x32);
 }
 
 static inline float w_float_horizontal_add(w_float v)
 {
-    __m128 swap_two_by_two = _mm_shuffle_ps(v.v, v.v, _MM_SHUFFLE(2, 3, 0, 1));
-    __m128 sum1 = _mm_add_ps(v.v, swap_two_by_two);
-
-    __m128 sum1shifted = _mm_movehl_ps(sum1, sum1);
-    __m128 sum2 = _mm_add_ss(sum1, sum1shifted);
-
-    return _mm_cvtss_f32(sum2);
+    /* ( x3+x7, x2+x6, x1+x5, x0+x4 ) */
+    const __m128 x128 = _mm_add_ps(_mm256_extractf128_ps(v.v, 1), _mm256_castps256_ps128(v.v));
+    /* ( -, -, x1+x3+x5+x7, x0+x2+x4+x6 ) */
+    const __m128 x64 = _mm_add_ps(x128, _mm_movehl_ps(x128, x128));
+    /* ( -, -, -, x0+x1+x2+x3+x4+x5+x6+x7 ) */
+    const __m128 x32 = _mm_add_ss(x64, _mm_shuffle_ps(x64, x64, 0x55));
+    /* Conversion to float is a no-op on x86-64 */
+    return _mm_cvtss_f32(x32);
 }
 
 static inline w_u32 w_float_ge(w_float u, w_float v)
 {
     w_u32 res;
-    res.v = (__m128i)_mm_cmpge_ps(u.v, v.v);
+    res.v = (__m256i)_mm256_cmp_ps(u.v, v.v, _CMP_GE_OS);
 
     return res;
 }
@@ -711,7 +659,7 @@ static inline w_u32 w_float_ge(w_float u, w_float v)
 static inline w_u32 w_float_gt(w_float u, w_float v)
 {
     w_u32 res;
-    res.v = (__m128i)_mm_cmpgt_ps(u.v, v.v);
+    res.v = (__m256i)_mm256_cmp_ps(u.v, v.v, _CMP_GT_OS);
 
     return res;
 }
@@ -719,7 +667,7 @@ static inline w_u32 w_float_gt(w_float u, w_float v)
 static inline w_u32 w_float_le(w_float u, w_float v)
 {
     w_u32 res;
-    res.v = (__m128i)_mm_cmple_ps(u.v, v.v);
+    res.v = (__m256i)_mm256_cmp_ps(u.v, v.v, _CMP_LE_OS);
 
     return res;
 }
@@ -727,7 +675,7 @@ static inline w_u32 w_float_le(w_float u, w_float v)
 static inline w_u32 w_float_lt(w_float u, w_float v)
 {
     w_u32 res;
-    res.v = (__m128i)_mm_cmplt_ps(u.v, v.v);
+    res.v = (__m256i)_mm256_cmp_ps(u.v, v.v, _CMP_LT_OS);
 
     return res;
 }
@@ -735,14 +683,32 @@ static inline w_u32 w_float_lt(w_float u, w_float v)
 static inline w_u32 w_u32_write(const u32 vals[SIMD_LANES])
 {
     w_u32 res;
-    res.v = _mm_set_epi32(vals[3], vals[2], vals[1], vals[0]);
+    res.v = _mm256_set_epi32(vals[7], vals[6], vals[5], vals[4], vals[3], vals[2], vals[1], vals[0]);
 
     return res;
 }
 
 static inline void w_u32_read(w_u32 v, u32 out[SIMD_LANES])
 {
-    _mm_store_si128((__m128i*)out, v.v);
+    _mm256_store_si256((__m256i*)out, v.v);
+}
+
+static inline void w_float_conditional_assign(w_u32 mask, w_float* lhs, w_float rhs)
+{
+    lhs->v = _mm256_blendv_ps(lhs->v, rhs.v, w_u32_pun_float(mask).v);
+}
+
+static inline void w_u32_conditional_assign(w_u32 mask, w_u32* lhs, w_u32 rhs)
+{
+    w_float lhs_f = w_u32_pun_float(*lhs);
+    w_float rhs_f = w_u32_pun_float(rhs);
+    w_float_conditional_assign(mask, &lhs_f, rhs_f);
+    *lhs = w_float_pun_u32(lhs_f);
+}
+
+static inline b32 w_u32_mask_any(w_u32 mask)
+{
+    return _mm256_movemask_ps((__m256)mask.v);
 }
 
 #else
