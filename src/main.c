@@ -13,19 +13,18 @@
 
 #include <unistd.h>
 
-#include "base_types.h"
-#include "logging.h"
 #include "my_assert.h"
+#include "platform/base_types.h"
+#include "platform/logging.h"
+#include "platform/util.h"
 #include "simd.h"
 #include "stb_image_write.h"
-#include "util.h"
 
-#include "platform.h"
+#include "platform/platform.h"
 
 #define FETCH_ADD(ptr, val) __atomic_fetch_add(ptr, val, __ATOMIC_RELAXED)
 #define COMPARE_AND_SWAP(ptr, oldval, newval)                                                                          \
     __atomic_compare_exchange_n(ptr, &oldval, newval, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)
-
 
 typedef struct {
     v3 emission;
@@ -678,7 +677,7 @@ static void reset_render(RenderContext* ctx)
     mtx_unlock(&ctx->film_mtx);
 }
 
-int main(int /* argc */, const char* argv[])
+int main(int argc, const char* argv[])
 {
     srand(time(0));
 
@@ -863,16 +862,18 @@ int main(int /* argc */, const char* argv[])
         platform_sleep_nanoseconds(10ull * 1000ull * 1000ull);
     }
 
-    ctx.end_timestamp = get_nanoseconds();
-    u64 elapsed_ns = (ctx.end_timestamp - ctx.begin_timestamp);
-    u32 elapsed_ms = elapsed_ns / (1000ull * 1000ull);
-    printf("Took %u ms, traced %.3g rays, %.2f worker.ns per ray (%.1f MRay/(worker.s))\n",
-           elapsed_ms,
-           (float)ctx.traced_ray_count,
-           (float)config.worker_count * elapsed_ns / ctx.traced_ray_count,
-           1000.0f * ctx.traced_ray_count / (elapsed_ns * config.worker_count));
+    if (!ctx.end_timestamp) {
+        ctx.end_timestamp = get_nanoseconds();
+        u64 elapsed_ns = (ctx.end_timestamp - ctx.begin_timestamp);
+        u32 elapsed_ms = elapsed_ns / (1000ull * 1000ull);
+        printf("Took %u ms, traced %.3g rays, %.2f worker.ns per ray (%.1f MRay/(worker.s))\n",
+               elapsed_ms,
+               (float)ctx.traced_ray_count,
+               (float)config.worker_count * elapsed_ns / ctx.traced_ray_count,
+               1000.0f * ctx.traced_ray_count / (elapsed_ns * config.worker_count));
+    }
 
-    ctx.stop_requested = true;
+    ctx.stop_requested = true; // tell workers to stop, then join
 
     for (u32 i = 0; i < config.worker_count; i++) {
         int res;

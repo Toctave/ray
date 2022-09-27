@@ -1,8 +1,8 @@
 #pragma once
 
-#include "assert.h"
-#include "base_types.h"
 #include "my_math.h"
+#include "platform/assert.h"
+#include "platform/base_types.h"
 
 #define SIMD_LANES 8
 
@@ -521,46 +521,58 @@ static inline w_u32 w_u32_andnot(w_u32 lhs, w_u32 rhs)
 
 static inline w_u32 w_u32_shr(w_u32 lhs, u32 imm)
 {
-    __m128i lo, hi;
-    _mm256_storeu2_m128i(&hi, &lo, lhs.v);
-
-    lo = _mm_srli_epi32(lo, imm);
-    hi = _mm_srli_epi32(hi, imm);
-
     w_u32 res;
-    res.v = _mm256_loadu2_m128i(&hi, &lo);
+    res.v = _mm256_srli_epi32(lhs.v, imm);
 
     return res;
+    /* __m128i lo, hi; */
+    /* _mm256_storeu2_m128i(&hi, &lo, lhs.v); */
+
+    /* lo = _mm_srli_epi32(lo, imm); */
+    /* hi = _mm_srli_epi32(hi, imm); */
+
+    /* w_u32 res; */
+    /* res.v = _mm256_loadu2_m128i(&hi, &lo); */
+
+    /* return res; */
 }
 
 static inline w_u32 w_u32_shl(w_u32 lhs, u32 imm)
 {
-    __m128i lo, hi;
-    _mm256_storeu2_m128i(&hi, &lo, lhs.v);
-
-    lo = _mm_slli_epi32(lo, imm);
-    hi = _mm_slli_epi32(hi, imm);
-
     w_u32 res;
-    res.v = _mm256_loadu2_m128i(&hi, &lo);
+    res.v = _mm256_slli_epi32(lhs.v, imm);
 
     return res;
+    /* __m128i lo, hi; */
+    /* _mm256_storeu2_m128i(&hi, &lo, lhs.v); */
+
+    /* lo = _mm_slli_epi32(lo, imm); */
+    /* hi = _mm_slli_epi32(hi, imm); */
+
+    /* w_u32 res; */
+    /* res.v = _mm256_loadu2_m128i(&hi, &lo); */
+
+    /* return res; */
 }
 
 static inline w_u32 w_u32_add(w_u32 lhs, w_u32 rhs)
 {
-    __m128i lhs_lo, lhs_hi;
-    __m128i rhs_lo, rhs_hi;
-    _mm256_storeu2_m128i(&lhs_hi, &lhs_lo, lhs.v);
-    _mm256_storeu2_m128i(&rhs_hi, &rhs_lo, rhs.v);
-
-    __m128i lo = _mm_add_epi32(lhs_lo, rhs_lo);
-    __m128i hi = _mm_add_epi32(lhs_hi, rhs_hi);
-
     w_u32 res;
-    res.v = _mm256_loadu2_m128i(&hi, &lo);
+    res.v = _mm256_add_epi32(lhs.v, rhs.v);
 
     return res;
+    /* __m128i lhs_lo, lhs_hi; */
+    /* __m128i rhs_lo, rhs_hi; */
+    /* _mm256_storeu2_m128i(&lhs_hi, &lhs_lo, lhs.v); */
+    /* _mm256_storeu2_m128i(&rhs_hi, &rhs_lo, rhs.v); */
+
+    /* __m128i lo = _mm_add_epi32(lhs_lo, rhs_lo); */
+    /* __m128i hi = _mm_add_epi32(lhs_hi, rhs_hi); */
+
+    /* w_u32 res; */
+    /* res.v = _mm256_loadu2_m128i(&hi, &lo); */
+
+    /* return res; */
 }
 
 static inline w_float w_float_add(w_float lhs, w_float rhs)
